@@ -181,7 +181,7 @@ func (r *Router) login(c *gin.Context) {
 		Fail(c, 400, "AUTH_FAILED", err.Error())
 		return
 	}
-	OK(c, gin.H{"userId": u.ID, "username": u.Username, "nickname": u.Nickname, "avatar": u.Avatar, "token": t})
+	OK(c, LoginResponse{UserID: u.ID, Username: u.Username, Nickname: u.Nickname, Avatar: u.Avatar, Token: t})
 }
 
 // me godoc
@@ -196,7 +196,7 @@ func (r *Router) me(c *gin.Context) {
 		Fail(c, 404, "USER_NOT_FOUND", err.Error())
 		return
 	}
-	OK(c, u)
+	OK(c, toUserDTO(u))
 }
 
 // listGroups godoc
@@ -213,7 +213,7 @@ func (r *Router) listGroups(c *gin.Context) {
 		Fail(c, 500, "INTERNAL_ERROR", err.Error())
 		return
 	}
-	OK(c, page)
+	OK(c, toPageDTO(page, toGroupListItemDTO))
 }
 
 // createGroup godoc
@@ -236,7 +236,7 @@ func (r *Router) createGroup(c *gin.Context) {
 		return
 	}
 	r.pushIfDirect(c.Request.Context(), msg)
-	OK(c, g)
+	OK(c, toGroupDTO(*g))
 }
 
 // groupDetail godoc
@@ -262,7 +262,7 @@ func (r *Router) groupDetail(c *gin.Context) {
 		return
 	}
 	m, _ := r.repo.GetMember(c.Request.Context(), gid, uid(c))
-	OK(c, gin.H{"group": g, "myMember": m, "onlineUserIds": r.hub.OnlineUserIDs()})
+	OK(c, GroupDetailResponse{Group: toGroupDTO(*g), MyMember: toMemberDTOPtr(m), OnlineUserIDs: r.hub.OnlineUserIDs()})
 }
 
 // joinGroup godoc
@@ -294,7 +294,7 @@ func (r *Router) joinGroup(c *gin.Context) {
 	if result.Pending {
 		r.pushEventIfDirect(c.Request.Context(), gid, "group_join_request_created", result.Request)
 	}
-	OK(c, result)
+	OK(c, toJoinGroupResponse(result))
 }
 
 // members godoc
@@ -322,7 +322,7 @@ func (r *Router) members(c *gin.Context) {
 		Fail(c, 500, "INTERNAL_ERROR", err.Error())
 		return
 	}
-	OK(c, page)
+	OK(c, toPageDTO(page, toMemberDTO))
 }
 
 // leaveGroup godoc
@@ -503,7 +503,7 @@ func (r *Router) messages(c *gin.Context) {
 		Fail(c, 500, "INTERNAL_ERROR", err.Error())
 		return
 	}
-	OK(c, page)
+	OK(c, toPageDTO(page, toMessageDTO))
 }
 
 // recallMessage godoc
@@ -529,7 +529,7 @@ func (r *Router) recallMessage(c *gin.Context) {
 	}
 	// 撤回不是新消息，不占用 sequence；通过 WS 事件更新客户端本地消息状态。
 	r.pushEventIfDirect(c.Request.Context(), gid, "group_message_recalled", evt)
-	OK(c, evt)
+	OK(c, toRecallEventDTO(evt))
 }
 
 // read godoc
@@ -576,7 +576,7 @@ func (r *Router) mentions(c *gin.Context) {
 		Fail(c, 500, "INTERNAL_ERROR", err.Error())
 		return
 	}
-	OK(c, page)
+	OK(c, toPageDTO(page, toMentionDTO))
 }
 
 // readMentions godoc
@@ -620,7 +620,7 @@ func (r *Router) announcements(c *gin.Context) {
 		Fail(c, 500, "INTERNAL_ERROR", err.Error())
 		return
 	}
-	OK(c, page)
+	OK(c, toPageDTO(page, toAnnouncementDTO))
 }
 
 // createAnnouncement godoc
@@ -645,7 +645,7 @@ func (r *Router) createAnnouncement(c *gin.Context) {
 		return
 	}
 	r.pushIfDirect(c.Request.Context(), msg)
-	OK(c, a)
+	OK(c, toAnnouncementDTO(*a))
 }
 
 // updateAnnouncement godoc
@@ -672,7 +672,7 @@ func (r *Router) updateAnnouncement(c *gin.Context) {
 		return
 	}
 	r.pushIfDirect(c.Request.Context(), msg)
-	OK(c, a)
+	OK(c, toAnnouncementDTO(*a))
 }
 
 // deleteAnnouncement godoc
@@ -717,7 +717,7 @@ func (r *Router) joinRequests(c *gin.Context) {
 		Fail(c, 500, "INTERNAL_ERROR", err.Error())
 		return
 	}
-	OK(c, page)
+	OK(c, toPageDTO(page, toJoinRequestDTO))
 }
 
 // approveJoinRequest godoc
@@ -736,7 +736,7 @@ func (r *Router) approveJoinRequest(c *gin.Context) {
 	}
 	r.pushIfDirect(c.Request.Context(), msg)
 	r.hub.SendToUsers([]int64{jr.UserID}, "group_join_request_approved", jr)
-	OK(c, jr)
+	OK(c, toJoinRequestDTO(*jr))
 }
 
 // rejectJoinRequest godoc
@@ -754,7 +754,7 @@ func (r *Router) rejectJoinRequest(c *gin.Context) {
 		return
 	}
 	r.hub.SendToUsers([]int64{jr.UserID}, "group_join_request_rejected", jr)
-	OK(c, jr)
+	OK(c, toJoinRequestDTO(*jr))
 }
 
 func (r *Router) wsUpgrade(c *gin.Context) {
