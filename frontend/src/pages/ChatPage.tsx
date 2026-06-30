@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import { approveJoinRequest, createAnnouncement, createGroup, deleteAnnouncement, dismissGroup, getGroup, getMessages, joinGroup, kickMember, leaveGroup, listAnnouncements, listGroups, listJoinRequests, listMembers, markRead, muteMember, readMentions, recallMessage, rejectJoinRequest, setRole, unmuteMember, updateSettings } from '../api/groupApi';
+import { approveJoinRequest, createAnnouncement, createGroup, deleteAnnouncement, dismissGroup, getGroup, getMessages, getMessagesAround, joinGroup, kickMember, leaveGroup, listAnnouncements, listGroups, listJoinRequests, listMembers, markRead, muteMember, readMentions, recallMessage, rejectJoinRequest, setRole, unmuteMember, updateSettings } from '../api/groupApi';
 import { useStore } from '../stores/useStore';
 import { wsClient } from '../websocket/wsClient';
 import { VirtualMessageList } from '../components/VirtualMessageList';
+import { MessageSearchPanel } from '../components/MessageSearchPanel';
 import type { Announcement, Group, GroupMessage, JoinRequest, Member } from '../types';
 
 export function ChatPage() {
@@ -14,6 +15,8 @@ export function ChatPage() {
   const [joinReason, setJoinReason] = useState('想加入一起学习高并发');
   const [mentionAll, setMentionAll] = useState(false);
   const [mentionIds, setMentionIds] = useState('');
+  const [searchScope, setSearchScope] = useState<'none'|'group'|'global'>('none');
+  const [jumpSeq, setJumpSeq] = useState<number | undefined>(undefined);
   const msgs = currentGroup ? (messagesByGroup[currentGroup.groupId] || []) : [];
 
   useEffect(() => { refreshGroups(); wsClient.connect(); }, []);
@@ -24,6 +27,7 @@ export function ChatPage() {
     if (!currentGroup && page.items[0]) openGroup(page.items[0]);
   }
   async function openGroup(g: Group) {
+    setJumpSeq(undefined);
     const detail = await getGroup(g.groupId);
     setCurrentGroup({ ...detail.group, myRole: detail.myMember?.role });
     const page = await getMessages(g.groupId, { limit:50 });
@@ -38,6 +42,25 @@ export function ChatPage() {
     if (!currentGroup || !msgs[0]?.sequence) return;
     const page = await getMessages(currentGroup.groupId, { beforeSequence: msgs[0].sequence, limit:50 });
     mergeMessages(currentGroup.groupId, page.items);
+  }
+  // 搜索结果点击跳转：切到目标群、加载该消息上下文窗口并高亮定位。
+  async function jumpTo(groupId: number, sequence: number) {
+    setSearchScope('none');
+    if (!currentGroup || currentGroup.groupId !== groupId) {
+      const g = groups.find(x => x.groupId === groupId);
+      const detail = g || (await getGroup(groupId)).group;
+      await openGroup(detail as Group);
+    }
+    const page = await getMessagesAround(groupId, sequence, 20);
+    setMessages(groupId, page.items);
+    setJumpSeq(sequence);
+  }
+  // 退出跳转态，回到最新消息。
+  async function backToLatest() {
+    if (!currentGroup) return;
+    setJumpSeq(undefined);
+    const page = await getMessages(currentGroup.groupId, { limit:50 });
+    setMessages(currentGroup.groupId, page.items);
   }
   async function send() {
     if (!currentGroup || !text.trim()) return;
@@ -105,7 +128,7 @@ export function ChatPage() {
 
   return <div className="app-shell">
     <aside className="left-panel">
-      <div className="topbar"><b>群流</b><span className={`dot ${connectionStatus}`}>{connectionStatus}</span></div>
+      <div className="topbar"><b>群流</b><button className="mini-btn" onClick={()=>setSearchScope('global')}>🔍 全局搜索</button><span className={`dot ${connectionStatus}`}>{connectionStatus}</span></div>
       <div className="create-row"><input value={newGroup} onChange={e=>setNewGroup(e.target.value)} placeholder="创建群名称"/><button onClick={create}>建群</button></div>
       <div className="create-row stacked"><input value={joinId} onChange={e=>setJoinId(e.target.value)} placeholder="群ID"/><input value={joinReason} onChange={e=>setJoinReason(e.target.value)} placeholder="加群理由"/><button onClick={join}>加入/申请</button></div>
       <div className="group-list">{groups.map(g => <button className={`group-item ${currentGroup?.groupId === g.groupId ? 'active' : ''}`} key={g.groupId} onClick={()=>openGroup(g)}>
@@ -114,9 +137,9 @@ export function ChatPage() {
     </aside>
     <main className="chat-panel">
       {!currentGroup ? <div className="empty">请选择或创建一个群</div> : <>
-        <header className="chat-header"><div><h2>{currentGroup.name}</h2><p>群ID {currentGroup.groupId} · {currentGroup.memberCount} 人 · {currentGroup.groupType === 'large' ? '大群模式' : '普通群'} · 慢速 {currentGroup.slowModeSeconds}s · {currentGroup.muteAll ? '全员禁言' : '可发言'} · 入群 {currentGroup.joinMode}</p></div><button onClick={readAll}>标记已读</button></header>
-        <button className="load-more" onClick={loadMore}>加载更多历史消息</button>
-        <VirtualMessageList messages={msgs} myUserId={user?.userId} myRole={currentGroup.myRole} onRecall={recall} onRetry={m=>wsClient.retry(currentGroup.groupId, m.clientMessageId)}/>
+        <header className="chat-header"><div><h2>{currentGroup.name}</h2><p>群ID {currentGroup.groupId} · {currentGroup.memberCount} 人 · {currentGroup.groupType === 'large' ? '大群模式' : '普通群'} · 慢速 {currentGroup.slowModeSeconds}s · {currentGroup.muteAll ? '全员禁言' : '可发言'} · 入群 {currentGroup.joinMode}</p></div><div className="header-actions"><button onClick={()=>setSearchScope('group')}>🔍 搜索</button><button onClick={readAll}>标记已读</button></div></header>
+        {jumpSeq ? <button className="load-more" onClick={backToLatest}>↓ 回到最新消息</button> : <button className="load-more" onClick={loadMore}>加载更多历史消息</button>}
+        <VirtualMessageList messages={msgs} myUserId={user?.userId} myRole={currentGroup.myRole} onRecall={recall} onRetry={m=>wsClient.retry(currentGroup.groupId, m.clientMessageId)} highlightSequence={jumpSeq}/>
         <footer className="input-bar">
           <label className="check"><input type="checkbox" checked={mentionAll} onChange={e=>setMentionAll(e.target.checked)}/> @所有人</label>
           <input className="mention-input" value={mentionIds} onChange={e=>setMentionIds(e.target.value)} placeholder="@用户ID，逗号分隔"/>
@@ -125,6 +148,7 @@ export function ChatPage() {
         </footer>
         {notice && <div className="toast" onClick={()=>setNotice('')}>{notice}</div>}
       </>}
+      {searchScope !== 'none' && <MessageSearchPanel group={searchScope === 'group' ? currentGroup : undefined} groups={groups} members={members} onClose={()=>setSearchScope('none')} onJump={jumpTo}/>}
     </main>
     <aside className="right-panel">{currentGroup && <GroupSide group={currentGroup} members={members} reload={async()=>{await openGroup(currentGroup); await refreshMembers();}} actions={{toggleLarge,toggleMuteAll,slow,leave,dismiss}}/>}</aside>
   </div>;

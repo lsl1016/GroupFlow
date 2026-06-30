@@ -15,6 +15,8 @@ export type Announcement = { announcementId:number; groupId:number; operatorId:n
 export type JoinRequest = { requestId:number; groupId:number; userId:number; username:string; nickname:string; avatar:string; reason:string; status:'pending'|'approved'|'rejected'; operatorId?:number; createdAt:string; updatedAt:string };
 export type Mention = { mentionId:number; groupId:number; messageId:string; sequence:number; userId:number; mentionType:'user'|'all'; readStatus:boolean; content:string; senderName:string; createdAt:string };
 export type RecallEvent = { groupId:number; messageId:string; sequence:number; operatorId:number; senderId:number; reason?:string; recalledAt:string };
+export type SearchHit = { messageId:string; groupId:number; sequence:number; senderId:number; senderName:string; content:string; highlight:string; createdAt:number };
+export type SearchResult = { items:SearchHit[]; nextCursor:string; hasMore:boolean };
 export type Page<T> = { items:T[]; nextCursor:string; hasMore:boolean };
 export type ApiResp<T> = { errNo:number; errMsg:string; traceId:string; data:T };
 export type WSEnvelope<T=any> = { type:string; version?:string; requestId?:string; timestamp:number; data:T };

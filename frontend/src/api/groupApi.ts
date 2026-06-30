@@ -1,5 +1,5 @@
 import { request } from './request';
-import type { Announcement, Group, GroupMessage, JoinRequest, Member, Mention, Page, RecallEvent } from '../types';
+import type { Announcement, Group, GroupMessage, JoinRequest, Member, Mention, Page, RecallEvent, SearchResult } from '../types';
 
 export const listGroups = (cursor = '', limit = 30) => request<Page<Group>>(`/groups?cursor=${cursor}&limit=${limit}`);
 export const createGroup = (body: any) => request<Group>('/groups', { method:'POST', body: JSON.stringify(body) });
@@ -14,7 +14,20 @@ export const getMessages = (groupId:number, params:{beforeSequence?:number; afte
   qs.set('limit', String(params.limit || 50));
   return request<Page<GroupMessage>>(`/groups/${groupId}/messages?${qs}`);
 };
+export const getMessagesAround = (groupId:number, sequence:number, limit=20) => request<Page<GroupMessage>>(`/groups/${groupId}/messages?aroundSequence=${sequence}&limit=${limit}`);
 export const recallMessage = (groupId:number, messageId:string, reason='') => request<RecallEvent>(`/groups/${groupId}/messages/${messageId}/recall`, { method:'POST', body: JSON.stringify({ reason }) });
+
+export const searchMessages = (params:{ keyword?:string; groupId?:number; senderId?:number; startTime?:number; endTime?:number; cursor?:string; limit?:number }) => {
+  const qs = new URLSearchParams();
+  if (params.keyword) qs.set('keyword', params.keyword);
+  if (params.groupId) qs.set('groupId', String(params.groupId));
+  if (params.senderId) qs.set('senderId', String(params.senderId));
+  if (params.startTime) qs.set('startTime', String(params.startTime));
+  if (params.endTime) qs.set('endTime', String(params.endTime));
+  if (params.cursor) qs.set('cursor', params.cursor);
+  qs.set('limit', String(params.limit || 20));
+  return request<SearchResult>(`/search/messages?${qs}`);
+};
 export const markRead = (groupId:number, lastReadSequence:number) => request(`/groups/${groupId}/read`, { method:'POST', body: JSON.stringify({ lastReadSequence }) });
 export const updateSettings = (groupId:number, body:any) => request(`/groups/${groupId}/settings`, { method:'PATCH', body: JSON.stringify(body) });
 export const setRole = (groupId:number, userId:number, role:string) => request(`/groups/${groupId}/members/${userId}/role`, { method:'POST', body: JSON.stringify({ role }) });
