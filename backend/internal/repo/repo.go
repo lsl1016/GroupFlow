@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"groupflow/backend/internal/domain"
+	"groupflow/backend/internal/search"
 	"groupflow/backend/pkg/logx"
 )
 
@@ -318,7 +319,10 @@ func (r *Repository) AddMember(ctx context.Context, groupID int64, userID int64,
 		return dbErr(ctx, "add_member_begin_tx", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO group_member(group_id,user_id,role,status,last_read_sequence,joined_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status='normal', role=IF(role='owner',role,VALUES(role)), left_at=NULL, updated_at=VALUES(updated_at)`, groupID, userID, role, domain.StatusNormal, 0, t, t, t)
+	// 记录入群时群内最大序号，限制成员只能搜索加群后的消息；重新入群时刷新为当前序号。
+	var joinSeq int64
+	_ = tx.QueryRowContext(ctx, `SELECT max_sequence FROM chat_group WHERE id=?`, groupID).Scan(&joinSeq)
+	_, err = tx.ExecContext(ctx, `INSERT INTO group_member(group_id,user_id,role,status,last_read_sequence,join_sequence,joined_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status='normal', role=IF(role='owner',role,VALUES(role)), join_sequence=VALUES(join_sequence), left_at=NULL, updated_at=VALUES(updated_at)`, groupID, userID, role, domain.StatusNormal, 0, joinSeq, t, t, t)
 	if err != nil {
 		return dbErr(ctx, "add_member_upsert", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.String("role", role))
 	}
@@ -482,6 +486,68 @@ func insertOutboxTx(ctx context.Context, tx *sql.Tx, ob *domain.OutboxEvent, t t
 	_, err := tx.ExecContext(ctx, `INSERT INTO message_outbox(event_id,topic,aggregate_id,payload,status,retry_count,next_retry_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`,
 		ob.EventID, ob.Topic, ob.AggregateID, string(ob.Payload), "pending", 0, t, t, t)
 	return err
+}
+
+// ListUserGroupScopes 返回用户所有正常状态群的可搜索范围（群ID + 入群序号），用于搜索权限收敛。
+func (r *Repository) ListUserGroupScopes(ctx context.Context, userID int64) ([]search.GroupScope, error) {
+	defer slowSQL(ctx, "list_user_group_scopes", time.Now(), zap.Int64("userId", userID))
+	rows, err := r.db.QueryContext(ctx, `SELECT gm.group_id, gm.join_sequence FROM group_member gm JOIN chat_group g ON gm.group_id=g.id WHERE gm.user_id=? AND gm.status='normal' AND g.status='normal'`, userID)
+	if err != nil {
+		return nil, dbErr(ctx, "list_user_group_scopes", err, zap.Int64("userId", userID))
+	}
+	defer rows.Close()
+	scopes := []search.GroupScope{}
+	for rows.Next() {
+		var s search.GroupScope
+		if err := rows.Scan(&s.GroupID, &s.JoinSequence); err != nil {
+			return nil, dbErr(ctx, "scan_user_group_scope", err, zap.Int64("userId", userID))
+		}
+		scopes = append(scopes, s)
+	}
+	return scopes, rows.Err()
+}
+
+// ListMessagesAround 返回目标序号前后各 radius 条消息，用于搜索结果点击跳转时加载上下文窗口。
+func (r *Repository) ListMessagesAround(ctx context.Context, groupID, sequence int64, radius int) ([]domain.Message, error) {
+	if radius <= 0 || radius > 100 {
+		radius = 20
+	}
+	defer slowSQL(ctx, "list_messages_around", time.Now(), zap.Int64("groupId", groupID), zap.Int64("sequence", sequence))
+	rows, err := r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM `+r.messageTable(groupID)+` WHERE group_id=? AND sequence BETWEEN ? AND ? ORDER BY sequence ASC`, groupID, sequence-int64(radius), sequence+int64(radius))
+	if err != nil {
+		return nil, dbErr(ctx, "list_messages_around", err, zap.Int64("groupId", groupID), zap.Int64("sequence", sequence))
+	}
+	defer rows.Close()
+	items := make([]domain.Message, 0, radius*2+1)
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *m)
+	}
+	return items, rows.Err()
+}
+
+// ScanMessagesAfterID 按自增主键游标批量扫描正常状态消息，用于存量回填到 ES（默认单表）。
+func (r *Repository) ScanMessagesAfterID(ctx context.Context, afterID int64, limit int) ([]domain.Message, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM group_message WHERE id>? AND status='normal' ORDER BY id ASC LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, dbErr(ctx, "scan_messages_after_id", err, zap.Int64("afterId", afterID))
+	}
+	defer rows.Close()
+	items := make([]domain.Message, 0, limit)
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *m)
+	}
+	return items, rows.Err()
 }
 
 func (r *Repository) MaxSequence(ctx context.Context, groupID int64) (int64, error) {
@@ -834,7 +900,9 @@ func (r *Repository) ApproveJoinRequest(ctx context.Context, groupID, requestID,
 	if err != nil {
 		return nil, dbErr(ctx, "approve_join_update_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO group_member(group_id,user_id,role,status,last_read_sequence,joined_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status='normal', left_at=NULL, updated_at=VALUES(updated_at)`, groupID, userID, domain.RoleMember, domain.StatusNormal, 0, t, t, t)
+	var joinSeq int64
+	_ = tx.QueryRowContext(ctx, `SELECT max_sequence FROM chat_group WHERE id=?`, groupID).Scan(&joinSeq)
+	_, err = tx.ExecContext(ctx, `INSERT INTO group_member(group_id,user_id,role,status,last_read_sequence,join_sequence,joined_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status='normal', join_sequence=VALUES(join_sequence), left_at=NULL, updated_at=VALUES(updated_at)`, groupID, userID, domain.RoleMember, domain.StatusNormal, 0, joinSeq, t, t, t)
 	if err != nil {
 		return nil, dbErr(ctx, "approve_join_add_member", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 	}

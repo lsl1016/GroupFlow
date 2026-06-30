@@ -22,6 +22,7 @@ import (
 	"groupflow/backend/internal/config"
 	"groupflow/backend/internal/infra"
 	"groupflow/backend/internal/repo"
+	"groupflow/backend/internal/search"
 	"groupflow/backend/internal/service"
 	"groupflow/backend/internal/ws"
 )
@@ -50,6 +51,12 @@ func main() {
 	// 组装各层依赖：repo 数据访问 → service 业务逻辑 → ws 连接管理 → router HTTP 路由
 	r := repo.New(db, cfg.MessageShardCount)
 	svc := service.New(cfg, r, redis, producer, log)
+	// 装配 Elasticsearch 搜索后端（关闭时搜索接口返回未启用）。
+	if cfg.ESEnabled {
+		esClient := search.NewClient(cfg.ESAddrs, cfg.ESIndex)
+		svc.SetSearcher(r.ListUserGroupScopes, esClient.Search)
+		log.Info("search_enabled", zap.String("event", "search_enabled"), zap.Strings("esAddrs", cfg.ESAddrs), zap.String("esIndex", cfg.ESIndex))
+	}
 	hub := ws.NewHub(cfg, redis, log)
 	engine := api.NewRouter(cfg, svc, r, hub, log)
 

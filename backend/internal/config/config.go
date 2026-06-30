@@ -26,6 +26,11 @@ type Config struct {
 	WSAdvertisePushURL string
 	MessageShardCount  int
 
+	ESEnabled      bool
+	ESAddrs        []string
+	ESIndex        string
+	ESIndexerGroup string
+
 	LogLevel          string
 	LogFormat         string
 	LogOutput         string
@@ -69,6 +74,11 @@ func Load() Config {
 		InternalPushURL:    internalPushURL,
 		WSAdvertisePushURL: env("WS_ADVERTISE_PUSH_URL", internalPushURL),
 		MessageShardCount:  envInt("MESSAGE_SHARD_COUNT", 1),
+
+		ESEnabled:      envBool("ES_ENABLED", false),
+		ESAddrs:        split(env("ES_ADDRS", "http://localhost:9200")),
+		ESIndex:        env("ES_INDEX", "group_message"),
+		ESIndexerGroup: env("ES_INDEXER_CONSUMER_GROUP", "groupflow-es-indexer"),
 
 		LogLevel:          env("LOG_LEVEL", "info"),
 		LogFormat:         logFormat,

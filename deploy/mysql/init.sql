@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS group_member (
   role VARCHAR(32) NOT NULL DEFAULT 'member' COMMENT '角色 owner群主/admin管理员/member普通成员',
   status VARCHAR(32) NOT NULL DEFAULT 'normal' COMMENT '成员状态 normal正常/left退群/kicked被踢/muted禁言/deleted删除',
   last_read_sequence BIGINT NOT NULL DEFAULT 0 COMMENT '已读消息最大序号',
+  join_sequence BIGINT NOT NULL DEFAULT 0 COMMENT '入群时群内最大序号 用于限制只能搜索加群后的消息',
   joined_at DATETIME NOT NULL COMMENT '入群时间',
   left_at DATETIME DEFAULT NULL COMMENT '退群时间',
   created_at DATETIME NOT NULL COMMENT '创建时间',

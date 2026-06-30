@@ -1,0 +1,19 @@
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1
+  },
+  "mappings": {
+    "properties": {
+      "message_id":   { "type": "keyword" },
+      "group_id":     { "type": "long" },
+      "sequence":     { "type": "long" },
+      "sender_id":    { "type": "long" },
+      "sender_name":  { "type": "text", "fields": { "keyword": { "type": "keyword" } } },
+      "content":      { "type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart" },
+      "message_type": { "type": "keyword" },
+      "status":       { "type": "keyword" },
+      "created_at":   { "type": "date", "format": "epoch_millis" }
+    }
+  }
+}

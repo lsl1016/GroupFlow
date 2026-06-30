@@ -159,6 +159,30 @@ ACK：
 
 撤回接口为 `POST /api/v1/groups/{groupId}/messages/{messageId}/recall`。撤回会将 `group_message.status` 更新为 `recalled`，并写入 `group_message_recall` 审计表，再通过 WebSocket 广播 `group_message_recalled`。
 
+### 聊天历史搜索（Elasticsearch）
+
+支持按 **关键词 / 群成员 / 时间** 搜索历史消息，支持**单群内**或**全局跨群**两种范围，搜索结果点击可
+**跳转到群聊对应位置**。检索由 Elasticsearch 提供（`content` 使用 IK 中文分词）。
+
+- 搜索接口：`GET /api/v1/search/messages?keyword=&groupId=&senderId=&startTime=&endTime=&cursor=&limit=`
+  - 权限：只能搜自己所在的群，且每群仅可见 **加群之后**（`sequence >= join_sequence`）的消息；系统消息与已撤回消息不返回；`search_after` 游标分页。
+- 跳转上下文：`GET /api/v1/groups/{groupId}/messages?aroundSequence={seq}` 返回目标消息前后窗口。
+- 数据同步：新增独立 Kafka 消费者 `cmd/es-indexer`（独立 consumer group），订阅消息 topic 将
+  `group_message_created` 写入 ES、`group_message_recalled` 更新状态，以 `messageId` 幂等 upsert，可重放重建。
+- 存量回填：`cmd/es-backfill` 按主键游标批量 `_bulk` 灌入存量消息。
+
+新增环境变量：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ES_ENABLED` | `false` | 是否启用搜索后端；关闭时搜索接口返回 `SEARCH_DISABLED` |
+| `ES_ADDRS` | `http://localhost:9200` | Elasticsearch 节点地址（逗号分隔） |
+| `ES_INDEX` | `group_message` | 消息索引名 / 别名 |
+| `ES_INDEXER_CONSUMER_GROUP` | `groupflow-es-indexer` | 索引消费者的 Kafka consumer group |
+
+> 注：`group_member` 新增 `join_sequence` 列（入群时记录群内最大序号），用于约束“仅可搜索加群后消息”。
+> 修改了 `deploy/mysql/init.sql`，需 `docker compose down -v` 重置数据卷。
+
 ### Outbox 可靠投递与多节点路由
 
 开启 Kafka（`KAFKA_ENABLED=true`）后，消息事件会与消息落库在 **同一事务** 内写入 `message_outbox`，

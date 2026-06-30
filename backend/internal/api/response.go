@@ -61,6 +61,10 @@ var errNoMap = map[string]int{
 	// 加群审批 (240xx)
 	"APPROVE_JOIN_FAILED": 24001,
 	"REJECT_JOIN_FAILED":  24002,
+
+	// 搜索 (250xx)
+	"SEARCH_FAILED":   25001,
+	"SEARCH_DISABLED": 25002,
 }
 
 func errNoOf(code string) int {

@@ -16,6 +16,7 @@ import (
 	"groupflow/backend/internal/domain"
 	"groupflow/backend/internal/infra"
 	"groupflow/backend/internal/repo"
+	"groupflow/backend/internal/search"
 	"groupflow/backend/pkg/auth"
 	"groupflow/backend/pkg/id"
 	"groupflow/backend/pkg/logx"
@@ -48,6 +49,9 @@ type Service struct {
 
 	readMemberLookup func(ctx context.Context, groupID, userID int64) (*domain.Member, error)
 	readPersist      func(ctx context.Context, groupID, userID, lastRead int64) error
+
+	searchScopeLookup func(ctx context.Context, userID int64) ([]search.GroupScope, error)
+	searchExecute     func(ctx context.Context, query map[string]any) ([]byte, error)
 }
 
 // SetReadHooksForTest 注入已读位置读取/持久化的测试替身，仅供测试使用。

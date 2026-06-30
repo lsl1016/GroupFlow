@@ -79,6 +79,28 @@ services:
     networks:
       - groupflow-net
 
+  elasticsearch:
+    build:
+      context: ./deploy/elasticsearch
+      dockerfile: Dockerfile
+    container_name: groupflow-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks:
+      - groupflow-net
+
   groupflow-api:
     build:
       context: ./backend
@@ -91,6 +113,9 @@ services:
       HTTP_ADDR: :8080
       SERVER_ID: ws-server-01
       WS_INTERNAL_PUSH_URL: http://groupflow-api:8080/internal/push
+      ES_ENABLED: "true"
+      ES_ADDRS: http://elasticsearch:9200
+      ES_INDEX: group_message
     ports:
       - "8080:8080"
     depends_on:
@@ -120,6 +145,30 @@ services:
     depends_on:
       groupflow-api:
         condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - groupflow-net
+
+  groupflow-es-indexer:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: groupflow-es-indexer
+    restart: unless-stopped
+    command: ["/app/groupflow-es-indexer"]
+    env_file:
+      - ./.env
+    environment:
+      HTTP_ADDR: :8083
+      ES_ENABLED: "true"
+      ES_ADDRS: http://elasticsearch:9200
+      ES_INDEX: group_message
+    ports:
+      - "8083:8083"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
     networks:
@@ -213,6 +262,7 @@ volumes:
   prometheus-data:
   grafana-data:
   loki-data:
+  es-data:
 
 networks:
   groupflow-net:

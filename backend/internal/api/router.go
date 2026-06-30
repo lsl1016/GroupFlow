@@ -48,6 +48,7 @@ func NewRouter(cfg config.Config, svc *service.Service, repo *repo.Repository, h
 	v1.GET("/health", r.health)
 	v1.POST("/auth/login", r.login)
 	v1.GET("/auth/me", r.authRequired(), r.me)
+	v1.GET("/search/messages", r.authRequired(), r.searchMessages)
 
 	groups := v1.Group("/groups", r.authRequired())
 	groups.GET("", r.listGroups)
@@ -496,6 +497,20 @@ func (r *Router) messages(c *gin.Context) {
 		Fail(c, 403, "FORBIDDEN", "not group member")
 		return
 	}
+	// aroundSequence：搜索结果点击跳转时加载目标消息前后上下文窗口。
+	if around := queryInt(c, "aroundSequence"); around > 0 {
+		msgs, err := r.repo.ListMessagesAround(c.Request.Context(), gid, around, int(limit(c, 20)))
+		if err != nil {
+			Fail(c, 500, "INTERNAL_ERROR", err.Error())
+			return
+		}
+		items := make([]MessageDTO, 0, len(msgs))
+		for i := range msgs {
+			items = append(items, toMessageDTO(msgs[i]))
+		}
+		OK(c, gin.H{"items": items, "nextCursor": "", "hasMore": false})
+		return
+	}
 	before := queryInt(c, "beforeSequence")
 	after := queryInt(c, "afterSequence")
 	page, err := r.repo.ListMessages(c.Request.Context(), gid, before, after, limit(c, 50))
@@ -504,6 +519,44 @@ func (r *Router) messages(c *gin.Context) {
 		return
 	}
 	OK(c, toPageDTO(page, toMessageDTO))
+}
+
+// searchMessages godoc
+// @Summary 搜索历史消息（按文本/群成员/时间，支持单群或全局）
+// @Tags message
+// @Security BearerAuth
+// @Param keyword query string false "搜索关键词"
+// @Param groupId query int false "限定群ID，不传为全局搜索"
+// @Param senderId query int false "限定发送人用户ID"
+// @Param startTime query int false "起始时间 unix 秒"
+// @Param endTime query int false "结束时间 unix 秒"
+// @Param cursor query string false "分页游标"
+// @Param limit query int false "每页数量，默认20，上限50"
+// @Success 200 {object} Response
+// @Router /search/messages [get]
+func (r *Router) searchMessages(c *gin.Context) {
+	if !r.svc.SearchEnabled() {
+		Fail(c, 503, "SEARCH_DISABLED", "search backend not enabled")
+		return
+	}
+	res, err := r.svc.SearchMessages(c.Request.Context(), uid(c), service.SearchInput{
+		Keyword:   c.Query("keyword"),
+		GroupID:   queryInt(c, "groupId"),
+		SenderID:  queryInt(c, "senderId"),
+		StartTime: queryInt(c, "startTime"),
+		EndTime:   queryInt(c, "endTime"),
+		Cursor:    c.Query("cursor"),
+		Size:      int(limit(c, 20)),
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrForbidden) {
+			Fail(c, 403, "FORBIDDEN", "not a member of the requested group")
+			return
+		}
+		Fail(c, 500, "SEARCH_FAILED", err.Error())
+		return
+	}
+	OK(c, res)
 }
 
 // recallMessage godoc
