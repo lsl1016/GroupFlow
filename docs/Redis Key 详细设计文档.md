@@ -908,7 +908,25 @@ group:10001:admins = {1001, 1002}
 
 # 9. 群在线成员 Key
 
-## 9.1 群在线用户集合
+> **在线判定原则（重要 / 当前实现）**
+>
+> GroupFlow 的「在线」是**用户登录态的全局维度**，不是群维度：
+>
+> - **在线 = 用户已建立 WebSocket 连接（登录）**，与用户是否进入某个群无关。
+> - 在线态只用用户/连接维度的 key 表达：`online:user:{userId}:connections`、
+>   `connection:{connectionId}:server` 等（**均不含 groupId**）；心跳续期的也是这些
+>   登录态 key。
+> - 投递时不预先维护「每个群的在线集合」，而是枚举群成员后，按用户登录态过滤出在线者。
+>
+> 因此本章 `group:{groupId}:online_users` / `group:{groupId}:online_user:{userId}` /
+> `group:{groupId}:online_servers` / `group:{groupId}:server:{serverId}:users` 这类
+> **per-group（群维度）在线集合，当前不采用、也未实现**。它们作为历史设计方案保留在
+> 文档中，但与「在线 = 登录态全局维度」的设计理念冲突，不应再据此实现。
+>
+> 若未来确需降低大群投递的成员枚举压力，推荐方向是「全局在线用户集合 ∩ 群成员」，
+> 而不是为每个群维护一份在线集合。
+
+## 9.1 群在线用户集合（历史方案 / 未采用）
 
 ### Key
 
@@ -1322,25 +1340,29 @@ rate_limit:group:{groupId}:mention_all
 ### 类型
 
 ```text
-Counter
+String（SetNX 标记）
 ```
+
+> 代码现状：当前实现使用 `SET ... NX` 做窗口标记，而非 Counter 计数。
+> TTL 普通群 60 秒、大群 300 秒，由 `Service.checkMentionAll` 写入。
 
 ### 用途
 
 限制单个群在一个时间窗口内 @所有人的次数。
 
-### 示例规则
+### 示例规则（文档原始目标）
 
 ```text
 每个群每小时最多 10 次 @所有人
 ```
 
-### 实现方式
+### 实现方式（当前代码）
 
 ```text
-INCR rate_limit:group:{groupId}:mention_all
-EXPIRE 3600
+SET rate_limit:group:{groupId}:mention_all 1 EX {60 或 300} NX
 ```
+
+设置失败（key 已存在）即判定为限频命中，返回 ErrRateLimited。
 
 ### 超限处理
 
@@ -1363,24 +1385,27 @@ rate_limit:user:{userId}:mention_all
 ### 类型
 
 ```text
-Counter
+String（SetNX 标记）
 ```
+
+> 代码现状：已实现。与群维度 `rate_limit:group:{groupId}:mention_all` 在
+> `Service.checkMentionAll` 中一并校验，任一命中即返回 ErrRateLimited。
+> TTL 普通群 60 秒、大群 300 秒。
 
 ### 用途
 
 限制单个用户在多个群中频繁 @所有人。
 
-### 示例规则
+### 示例规则（文档原始目标）
 
 ```text
 每个管理员每小时最多 3 次 @所有人
 ```
 
-### 实现方式
+### 实现方式（当前代码）
 
 ```text
-INCR rate_limit:user:{userId}:mention_all
-EXPIRE 3600
+SET rate_limit:user:{userId}:mention_all 1 EX {60 或 300} NX
 ```
 
 ------
@@ -2286,3 +2311,57 @@ GroupFlow Redis Key 设计的核心是：
 13. 大群中要避免大 Key、避免全量 SMEMBERS、避免每条消息给每个用户写未读数。
 14. 所有运行时状态都要有 TTL、心跳续期和异常清理策略。
 15. MySQL 是最终数据源，Redis 数据丢失后应能恢复或重新注册。
+
+------
+
+# 26. 代码实现对齐说明（与当前实现核对）
+
+> 本节按当前后端代码实际实现核对上文设计，标注「已实现 / 已实现但与设计有差异 /
+> 未实现」三种状态，作为文档与代码之间的权威对照。
+
+## 26.1 已实现的 Key
+
+| Key | 类型 | TTL（代码） | 写入位置 | 读取位置 |
+| --- | --- | --- | --- | --- |
+| `online:user:{userId}:connections` | Set | 90s | `ws.renewRedis`（连接/心跳续期）；`ws.unregister` SREM | `delivery.resolveOnlineRoutes` SMEMBERS；死节点清理 SREM |
+| `online:user:{userId}` | String=serverId | 90s | `ws.renewRedis` | **当前代码只写不读**：路由实际走 connections 集合 + connection:server，该单值 key 仅作冗余/兼容保留 |
+| `connection:{connectionId}:user` | String=userId | 90s | `ws.renewRedis`；`ws.unregister` DEL | 死节点清理 GET/DEL |
+| `connection:{connectionId}:server` | String=serverId | 90s | `ws.renewRedis`；`ws.unregister` DEL | `delivery.resolveOnlineRoutes` GET |
+| `server:{serverId}:connections` | Set | 90s | `ws.renewRedis` | `delivery.scanActiveServerIDs` SCAN；死节点清理 SMEMBERS/DEL |
+| `server:{serverId}:push_url` | String=推送地址 | 90s | `ws.renewRedis` | `delivery.pushURL` GET |
+| `server:{serverId}:heartbeat` | String=毫秒时间戳 | **30s** | `ws.RunHeartbeat`（每 10s 续期） | `delivery.isServerAlive` EXISTS（死节点判定） |
+| `group:{groupId}:sequence` | Counter | 不设置 | `service.nextSequence`（Lua INCR / 冷启动 SET+INCR） | 同一处 INCR 返回 |
+| `group:{groupId}:config` | String JSON | **10 分钟** | `service.cacheGroupConfig`；`UpdateSettings` 后 `invalidateGroupConfigCache` DEL | `service.getGroupConfig` GET（发消息热路径） |
+| `rate_limit:group:{groupId}:user:{userId}` | String SetNX | = slowModeSeconds | `service.checkSlowMode` | SetNX 成败即结果 |
+| `rate_limit:group:{groupId}:mention_all` | String SetNX | 60s / 大群 300s | `service.checkMentionAll` | SetNX 成败即结果 |
+| `rate_limit:user:{userId}:mention_all` | String SetNX | 60s / 大群 300s | `service.checkMentionAll` | SetNX 成败即结果 |
+| `rate_limit:user:{userId}:send_message` | Counter | **1 秒窗口** | `service.checkGlobalSendRateLimit`（INCR+EXPIRE） | INCR 计数 > 5 即限流 |
+
+## 26.2 已实现但与原设计有差异
+
+- `@所有人` 限频实现使用 `SET NX` 标记而非 `INCR` 计数器，窗口为 60s/300s
+  （不是文档示例的“每小时 N 次”计数语义）。
+- `rate_limit:user:{userId}:send_message` 为 1 秒窗口、阈值 5 条的简单计数，
+  不是令牌桶。
+- 群配置缓存 `group:{groupId}:config` 采用 String JSON + 10 分钟 TTL，
+  写策略为“先更 MySQL 再删缓存”（与 §7 设计一致）。
+- `server:{serverId}:heartbeat` 实现为 10s 续期 / 30s TTL（与 §5.2 设计一致）；
+  死节点判定不依赖 `servers:ws:active`，而是 `SCAN server:*:connections` 动态枚举
+  节点后按 heartbeat 是否存在判活。
+
+## 26.3 未实现 / 已回退（设计保留，代码暂未落地）
+
+- `group:{groupId}:online_users`、`group:{groupId}:online_user:{userId}`：
+  **按设计理念不采用**（群维度在线集合，与「在线 = 用户登录态全局维度」冲突）。
+  当前大群投递走「全量活跃成员枚举 + 用户登录态在线过滤」。
+- `group:{groupId}:online_servers`、`group:{groupId}:server:{serverId}:users`：
+  **不采用**（同为群维度方案）。
+- `servers:ws:active`：未实现，活跃节点通过 `SCAN server:*:connections` 动态推导。
+- `group:{groupId}:user:{userId}:last_read_sequence`：未实现 Redis 缓存，
+  已读位置仅落 MySQL `group_member.last_read_sequence`；已读回退由 service 层
+  `UpdateReadPosition` 校验并返回 `READ_SEQUENCE_ROLLBACK`。
+- `group:{groupId}:user:{userId}:unread_count`：未实现（按设计建议按需计算）。
+- `hot_group:{groupId}`、`hot_group:{groupId}:strategy`：未实现。
+- `delivery:message:{messageId}:status`、`lock:delivery:message:{messageId}`、
+  `idempotent:message:{senderId}:{clientMessageId}`：未实现（幂等由 MySQL 唯一索引 +
+  事务 Outbox 保证；Delivery 失败靠短重试与未提交 offset 兜底）。

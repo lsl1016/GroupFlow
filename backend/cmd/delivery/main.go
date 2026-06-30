@@ -45,6 +45,7 @@ func main() {
 			log.Error("delivery_consumer_stopped", zap.String("event", "delivery_consumer_stopped"), zap.Error(err))
 		}
 	}()
+	go consumer.RunCleanup(ctx)
 
 	// 启动健康检查 / 指标 HTTP 服务（/health、/metrics）
 	gin.SetMode(gin.ReleaseMode)

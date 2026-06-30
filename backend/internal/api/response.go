@@ -48,9 +48,10 @@ var errNoMap = map[string]int{
 	"UNMUTE_FAILED":   21004,
 
 	// 消息 (220xx)
-	"RECALL_FAILED":       22001,
-	"READ_FAILED":         22002,
-	"MENTION_READ_FAILED": 22003,
+	"RECALL_FAILED":          22001,
+	"READ_FAILED":            22002,
+	"MENTION_READ_FAILED":    22003,
+	"READ_SEQUENCE_ROLLBACK": 22004,
 
 	// 公告 (230xx)
 	"ANNOUNCEMENT_CREATE_FAILED": 23001,

@@ -86,9 +86,10 @@ type UpdateAnnouncementRequest struct {
 
 // InternalPushRequest 内部服务（Delivery）回推 WS 消息的请求体。
 type InternalPushRequest struct {
-	UserIDs []int64         `json:"userIds"` // 目标用户 ID 列表
-	Type    string          `json:"type"`    // WS 事件类型，缺省为 group_message_receive
-	Data    json.RawMessage `json:"data"`    // 透传的业务负载，原样下发
+	UserIDs       []int64         `json:"userIds,omitempty"`       // 兼容旧路径：目标用户 ID 列表
+	ConnectionIDs []string        `json:"connectionIds,omitempty"` // 优先路径：目标连接 ID 列表
+	Type          string          `json:"type"`                    // WS 事件类型，缺省为 group_message_receive
+	Data          json.RawMessage `json:"data"`                    // 透传的业务负载，原样下发
 }
 
 // ============================ 响应 DTO ============================

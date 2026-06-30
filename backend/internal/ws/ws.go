@@ -118,6 +118,35 @@ func (h *Hub) unregister(c *Client) {
 	h.log.Info("ws_disconnected", zap.String("event", "ws_disconnected"), zap.Int64("userId", c.UserID), zap.String("connectionId", c.ID), zap.String("serverId", h.cfg.ServerID), zap.Int64("onlineDurationSeconds", int64(time.Since(c.ConnectedAt).Seconds())))
 }
 
+func (h *Hub) heartbeatPayloadForTest() (string, string, time.Duration) {
+	return fmt.Sprintf("server:%s:heartbeat", h.cfg.ServerID), fmt.Sprintf("%d", time.Now().UnixMilli()), 30 * time.Second
+}
+
+func (h *Hub) writeHeartbeat(ctx context.Context) error {
+	if h.redis == nil {
+		return nil
+	}
+	key, value, ttl := h.heartbeatPayloadForTest()
+	return h.redis.Set(ctx, key, value, ttl).Err()
+}
+
+func (h *Hub) RunHeartbeat(ctx context.Context) {
+	if h.redis == nil {
+		return
+	}
+	_ = h.writeHeartbeat(ctx)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = h.writeHeartbeat(ctx)
+		}
+	}
+}
+
 func (h *Hub) renewRedis(ctx context.Context, c *Client) {
 	if h.redis == nil {
 		return
@@ -149,6 +178,27 @@ func (h *Hub) SendToUsers(userIDs []int64, msgType string, data any) int {
 			default:
 				h.log.Warn("ws send channel full", zap.Int64("userId", uid))
 			}
+		}
+	}
+	return count
+}
+
+func (h *Hub) SendToConnections(connectionIDs []string, msgType string, data any) int {
+	payload := Build(msgType, "", data)
+	b, _ := json.Marshal(payload)
+	count := 0
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, connectionID := range connectionIDs {
+		c, ok := h.clients[connectionID]
+		if !ok {
+			continue
+		}
+		select {
+		case c.Send <- b:
+			count++
+		default:
+			h.log.Warn("ws send channel full", zap.Int64("userId", c.UserID), zap.String("connectionId", connectionID))
 		}
 	}
 	return count

@@ -22,12 +22,13 @@ import (
 )
 
 var (
-	ErrForbidden       = errors.New("forbidden")
-	ErrNotFound        = errors.New("not found")
-	ErrMuted           = errors.New("muted")
-	ErrRateLimited     = errors.New("rate limited")
-	ErrGroupDismissed  = errors.New("group dismissed")
-	ErrApprovalPending = errors.New("join request pending")
+	ErrForbidden            = errors.New("forbidden")
+	ErrNotFound             = errors.New("not found")
+	ErrMuted                = errors.New("muted")
+	ErrRateLimited          = errors.New("rate limited")
+	ErrGroupDismissed       = errors.New("group dismissed")
+	ErrApprovalPending      = errors.New("join request pending")
+	ErrReadSequenceRollback = errors.New("read sequence rollback")
 )
 
 type Service struct {
@@ -36,6 +37,60 @@ type Service struct {
 	Redis    *redis.Client
 	Producer infra.KafkaProducer
 	Log      *zap.Logger
+
+	groupConfigFetch func(ctx context.Context, groupID int64) (*domain.Group, error)
+	groupConfigGet   func(ctx context.Context, key string) ([]byte, error)
+	groupConfigSet   func(ctx context.Context, key string, value []byte, ttl time.Duration) error
+	groupConfigDel   func(ctx context.Context, key string) error
+
+	setNXRateLimit      func(ctx context.Context, key string, ttl time.Duration) (bool, error)
+	globalSendRateLimit func(ctx context.Context, key string, window time.Duration, limit int) error
+
+	readMemberLookup func(ctx context.Context, groupID, userID int64) (*domain.Member, error)
+	readPersist      func(ctx context.Context, groupID, userID, lastRead int64) error
+}
+
+// SetReadHooksForTest 注入已读位置读取/持久化的测试替身，仅供测试使用。
+func (s *Service) SetReadHooksForTest(
+	lookup func(ctx context.Context, groupID, userID int64) (*domain.Member, error),
+	persist func(ctx context.Context, groupID, userID, lastRead int64) error,
+) {
+	s.readMemberLookup = lookup
+	s.readPersist = persist
+}
+
+// UpdateReadPosition 校验并推进用户在群内的已读位置：仅群内正常成员可上报，
+// 已读序号只能前进，传入的 lastRead 小于当前已读位置时返回 ErrReadSequenceRollback。
+func (s *Service) UpdateReadPosition(ctx context.Context, groupID, userID, lastRead int64) error {
+	lookup := s.readMemberLookup
+	if lookup == nil {
+		lookup = s.Repo.GetMember
+	}
+	member, err := lookup(ctx, groupID, userID)
+	if err != nil {
+		// 非群成员（无记录）按权限拒绝处理，而不是当作 500 内部错误。
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrForbidden
+		}
+		return opErr(ctx, "update_read_get_member", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
+	}
+	if member == nil || member.Status != domain.StatusNormal {
+		return ErrForbidden
+	}
+	if lastRead < member.LastReadSequence {
+		return ErrReadSequenceRollback
+	}
+	if lastRead == member.LastReadSequence {
+		return nil
+	}
+	persist := s.readPersist
+	if persist == nil {
+		persist = s.Repo.UpdateRead
+	}
+	if err := persist(ctx, groupID, userID, lastRead); err != nil {
+		return opErr(ctx, "update_read_persist", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.Int64("lastRead", lastRead))
+	}
+	return nil
 }
 
 func New(cfg config.Config, r *repo.Repository, redis *redis.Client, producer infra.KafkaProducer, log *zap.Logger) *Service {
@@ -85,10 +140,11 @@ func (s *Service) CreateGroup(ctx context.Context, ownerID int64, name, desc, av
 }
 
 type JoinGroupResult struct {
-	Joined  bool                `json:"joined"`
-	Pending bool                `json:"pending"`
-	Request *domain.JoinRequest `json:"request,omitempty"`
-	Message *domain.Message     `json:"-"`
+	Joined        bool                  `json:"joined"`
+	Pending       bool                  `json:"pending"`
+	Request       *domain.JoinRequest   `json:"request,omitempty"`
+	Message       *domain.Message       `json:"-"`
+	RealtimeEvent *domain.RealtimeEvent `json:"-"`
 }
 
 func (s *Service) JoinGroup(ctx context.Context, groupID, userID int64, reason string) (*JoinGroupResult, error) {
@@ -106,12 +162,19 @@ func (s *Service) JoinGroup(ctx context.Context, groupID, userID int64, reason s
 		return &JoinGroupResult{Joined: true}, nil
 	}
 	if g.JoinMode == domain.JoinModeApproval {
-		jr, err := s.Repo.CreateJoinRequest(ctx, groupID, userID, reason)
+		adminIDs, err := s.listOwnerAndAdminIDs(ctx, groupID)
+		if err != nil {
+			return nil, opErr(ctx, "join_group_list_admins", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
+		}
+		jr, err := s.Repo.CreateJoinRequest(ctx, groupID, userID, reason, func(jr *domain.JoinRequest) *domain.OutboxEvent {
+			return s.newRealtimeEvent(ctx, "group_join_request_created", groupID, g.GroupType, userID, adminIDs, jr).Outbox
+		})
 		if err != nil {
 			return nil, opErr(ctx, "join_group_create_request", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 		}
+		realtimeEvent := s.newRealtimeEvent(ctx, "group_join_request_created", groupID, g.GroupType, userID, adminIDs, jr)
 		logx.From(ctx).Info("join_request_submitted", zap.String("event", "join_request_submitted"), zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.Int64("requestId", jr.ID))
-		return &JoinGroupResult{Pending: true, Request: jr}, nil
+		return &JoinGroupResult{Pending: true, Request: jr, RealtimeEvent: realtimeEvent}, nil
 	}
 	msg, err := s.addMemberAndSystemMessage(ctx, groupID, userID)
 	if err != nil {
@@ -121,29 +184,43 @@ func (s *Service) JoinGroup(ctx context.Context, groupID, userID int64, reason s
 	return &JoinGroupResult{Joined: true, Message: msg}, nil
 }
 
-func (s *Service) ApproveJoinRequest(ctx context.Context, groupID, operatorID, requestID int64) (*domain.JoinRequest, *domain.Message, error) {
+func (s *Service) ApproveJoinRequest(ctx context.Context, groupID, operatorID, requestID int64) (*domain.JoinRequest, *domain.Message, *domain.RealtimeEvent, error) {
+	if err := s.requireRole(ctx, groupID, operatorID, "approve_join"); err != nil {
+		return nil, nil, nil, err
+	}
+	g, err := s.Repo.GetGroup(ctx, groupID)
+	if err != nil {
+		return nil, nil, nil, opErr(ctx, "approve_join_get_group", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
+	}
+	jr, err := s.Repo.ApproveJoinRequest(ctx, groupID, requestID, operatorID, func(jr *domain.JoinRequest) *domain.OutboxEvent {
+		return s.newRealtimeEvent(ctx, "group_join_request_approved", groupID, g.GroupType, operatorID, []int64{jr.UserID}, jr).Outbox
+	})
+	if err != nil {
+		return nil, nil, nil, opErr(ctx, "approve_join_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
+	}
+	realtimeEvent := s.newRealtimeEvent(ctx, "group_join_request_approved", groupID, g.GroupType, operatorID, []int64{jr.UserID}, jr)
+	logx.From(ctx).Info("join_request_approved", zap.String("event", "join_request_approved"), zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("userId", jr.UserID), zap.Int64("operatorId", operatorID))
+	msg, _ := s.createSystemMessage(ctx, groupID, operatorID, fmt.Sprintf("%s 加入群聊", jr.Nickname), map[string]any{"event": "member_joined", "userId": jr.UserID})
+	return jr, msg, realtimeEvent, nil
+}
+
+func (s *Service) RejectJoinRequest(ctx context.Context, groupID, operatorID, requestID int64) (*domain.JoinRequest, *domain.RealtimeEvent, error) {
 	if err := s.requireRole(ctx, groupID, operatorID, "approve_join"); err != nil {
 		return nil, nil, err
 	}
-	jr, err := s.Repo.ApproveJoinRequest(ctx, groupID, requestID, operatorID)
+	g, err := s.Repo.GetGroup(ctx, groupID)
 	if err != nil {
-		return nil, nil, opErr(ctx, "approve_join_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
+		return nil, nil, opErr(ctx, "reject_join_get_group", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
 	}
-	logx.From(ctx).Info("join_request_approved", zap.String("event", "join_request_approved"), zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("userId", jr.UserID), zap.Int64("operatorId", operatorID))
-	msg, _ := s.createSystemMessage(ctx, groupID, operatorID, fmt.Sprintf("%s 加入群聊", jr.Nickname), map[string]any{"event": "member_joined", "userId": jr.UserID})
-	return jr, msg, nil
-}
-
-func (s *Service) RejectJoinRequest(ctx context.Context, groupID, operatorID, requestID int64) (*domain.JoinRequest, error) {
-	if err := s.requireRole(ctx, groupID, operatorID, "approve_join"); err != nil {
-		return nil, err
-	}
-	jr, err := s.Repo.RejectJoinRequest(ctx, groupID, requestID, operatorID)
+	jr, err := s.Repo.RejectJoinRequest(ctx, groupID, requestID, operatorID, func(jr *domain.JoinRequest) *domain.OutboxEvent {
+		return s.newRealtimeEvent(ctx, "group_join_request_rejected", groupID, g.GroupType, operatorID, []int64{jr.UserID}, jr).Outbox
+	})
 	if err != nil {
-		return nil, opErr(ctx, "reject_join_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
+		return nil, nil, opErr(ctx, "reject_join_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
 	}
+	realtimeEvent := s.newRealtimeEvent(ctx, "group_join_request_rejected", groupID, g.GroupType, operatorID, []int64{jr.UserID}, jr)
 	logx.From(ctx).Info("join_request_rejected", zap.String("event", "join_request_rejected"), zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("operatorId", operatorID))
-	return jr, nil
+	return jr, realtimeEvent, nil
 }
 
 func (s *Service) addMemberAndSystemMessage(ctx context.Context, groupID, userID int64) (*domain.Message, error) {
@@ -166,7 +243,7 @@ func (s *Service) LeaveGroup(ctx context.Context, groupID, userID int64) (*domai
 	if m.Role == domain.RoleOwner {
 		return nil, errors.New("owner cannot leave, dismiss group instead")
 	}
-	if err := s.Repo.MarkMemberStatus(ctx, groupID, userID, domain.MemberLeft); err != nil {
+	if err := s.Repo.MarkMemberStatus(ctx, groupID, userID, domain.MemberLeft, nil); err != nil {
 		return nil, opErr(ctx, "leave_group", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 	}
 	logx.From(ctx).Info("group_left", zap.String("event", "group_left"), zap.Int64("groupId", groupID), zap.Int64("userId", userID))
@@ -213,6 +290,9 @@ func (s *Service) UpdateSettings(ctx context.Context, groupID, operatorID int64,
 	if err := s.Repo.UpdateGroupSettings(ctx, groupID, fields); err != nil {
 		return nil, opErr(ctx, "update_settings", err, zap.Int64("groupId", groupID), zap.Int64("operatorId", operatorID))
 	}
+	if err := s.invalidateGroupConfigCache(ctx, groupID); err != nil {
+		return nil, opErr(ctx, "invalidate_group_config_cache", err, zap.Int64("groupId", groupID), zap.Int64("operatorId", operatorID))
+	}
 	logx.From(ctx).Info("group_settings_updated", zap.String("event", "group_settings_updated"), zap.Int64("groupId", groupID), zap.Int64("operatorId", operatorID), zap.Int("fieldCount", len(fields)))
 	return s.createSystemMessage(ctx, groupID, operatorID, "群设置已更新", map[string]any{"event": "group_settings_updated", "fields": fields})
 }
@@ -231,22 +311,28 @@ func (s *Service) SetMemberRole(ctx context.Context, groupID, operatorID, target
 	return s.createSystemMessage(ctx, groupID, operatorID, fmt.Sprintf("成员 %d 角色已变更为 %s", targetUserID, role), map[string]any{"event": "member_role_changed", "userId": targetUserID, "role": role})
 }
 
-func (s *Service) KickMember(ctx context.Context, groupID, operatorID, targetUserID int64) (*domain.Message, error) {
+func (s *Service) KickMember(ctx context.Context, groupID, operatorID, targetUserID int64) (*domain.Message, *domain.RealtimeEvent, error) {
 	if err := s.requireRole(ctx, groupID, operatorID, "kick_member"); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	target, err := s.Repo.GetMember(ctx, groupID, targetUserID)
 	if err != nil {
-		return nil, opErr(ctx, "kick_member_get_target", err, zap.Int64("groupId", groupID), zap.Int64("targetUserId", targetUserID))
+		return nil, nil, opErr(ctx, "kick_member_get_target", err, zap.Int64("groupId", groupID), zap.Int64("targetUserId", targetUserID))
 	}
 	if target.Role == domain.RoleOwner {
-		return nil, ErrForbidden
+		return nil, nil, ErrForbidden
 	}
-	if err := s.Repo.MarkMemberStatus(ctx, groupID, targetUserID, domain.MemberKicked); err != nil {
-		return nil, opErr(ctx, "kick_member", err, zap.Int64("groupId", groupID), zap.Int64("targetUserId", targetUserID))
+	g, err := s.Repo.GetGroup(ctx, groupID)
+	if err != nil {
+		return nil, nil, opErr(ctx, "kick_member_get_group", err, zap.Int64("groupId", groupID), zap.Int64("targetUserId", targetUserID))
+	}
+	realtimeEvent := s.newRealtimeEvent(ctx, "group_member_kicked", groupID, g.GroupType, operatorID, []int64{targetUserID}, map[string]any{"groupId": groupID, "userId": targetUserID})
+	if err := s.Repo.MarkMemberStatus(ctx, groupID, targetUserID, domain.MemberKicked, realtimeEvent.Outbox); err != nil {
+		return nil, nil, opErr(ctx, "kick_member", err, zap.Int64("groupId", groupID), zap.Int64("targetUserId", targetUserID))
 	}
 	logx.From(ctx).Info("member_kicked", zap.String("event", "member_kicked"), zap.Int64("groupId", groupID), zap.Int64("operatorId", operatorID), zap.Int64("targetUserId", targetUserID))
-	return s.createSystemMessage(ctx, groupID, operatorID, fmt.Sprintf("%s 被移出群聊", target.Nickname), map[string]any{"event": "member_kicked", "userId": targetUserID})
+	msg, err := s.createSystemMessage(ctx, groupID, operatorID, fmt.Sprintf("%s 被移出群聊", target.Nickname), map[string]any{"event": "member_kicked", "userId": targetUserID})
+	return msg, realtimeEvent, err
 }
 
 func (s *Service) MuteMember(ctx context.Context, groupID, operatorID, targetUserID int64, seconds int, reason string) (*domain.Message, error) {
@@ -351,12 +437,15 @@ func (s *Service) SendGroupMessage(ctx context.Context, in SendMessageInput) (*d
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, err
 	}
-	g, err := s.Repo.GetGroup(ctx, in.GroupID)
+	g, err := s.getGroupConfig(ctx, in.GroupID)
 	if err != nil {
 		return nil, false, opErr(ctx, "send_message_get_group", err, zap.Int64("groupId", in.GroupID), zap.Int64("senderId", in.SenderID))
 	}
 	if g.Status != domain.StatusNormal {
 		return nil, false, ErrGroupDismissed
+	}
+	if err := s.checkGlobalSendRateLimit(ctx, in.SenderID); err != nil {
+		return nil, false, err
 	}
 	member, err := s.Repo.GetMember(ctx, in.GroupID, in.SenderID)
 	if err != nil {
@@ -504,12 +593,43 @@ func (s *Service) nextSequence(ctx context.Context, groupID int64) (int64, error
 	return max + 1, nil
 }
 
+func (s *Service) useSetNXRateLimit(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	if s.setNXRateLimit != nil {
+		return s.setNXRateLimit(ctx, key, ttl)
+	}
+	if s.Redis == nil {
+		return true, nil
+	}
+	return s.Redis.SetNX(ctx, key, "1", ttl).Result()
+}
+
+func (s *Service) checkGlobalSendRateLimit(ctx context.Context, userID int64) error {
+	key := fmt.Sprintf("rate_limit:user:%d:send_message", userID)
+	if s.globalSendRateLimit != nil {
+		return s.globalSendRateLimit(ctx, key, time.Second, 5)
+	}
+	if s.Redis == nil {
+		return nil
+	}
+	count, err := s.Redis.Incr(ctx, key).Result()
+	if err != nil {
+		return nil
+	}
+	if count == 1 {
+		_ = s.Redis.Expire(ctx, key, time.Second).Err()
+	}
+	if count > 5 {
+		return ErrRateLimited
+	}
+	return nil
+}
+
 func (s *Service) checkSlowMode(ctx context.Context, g *domain.Group, m *domain.Member) error {
-	if g.SlowModeSeconds <= 0 || m.Role != domain.RoleMember || s.Redis == nil {
+	if g.SlowModeSeconds <= 0 || m.Role != domain.RoleMember {
 		return nil
 	}
 	key := fmt.Sprintf("rate_limit:group:%d:user:%d", g.ID, m.UserID)
-	ok, err := s.Redis.SetNX(ctx, key, "1", time.Duration(g.SlowModeSeconds)*time.Second).Result()
+	ok, err := s.useSetNXRateLimit(ctx, key, time.Duration(g.SlowModeSeconds)*time.Second)
 	if err != nil {
 		return nil
 	}
@@ -529,17 +649,19 @@ func (s *Service) checkMentionAll(ctx context.Context, g *domain.Group, m *domai
 	if g.MentionAllRole == domain.RoleAdmin && m.Role != domain.RoleOwner && m.Role != domain.RoleAdmin {
 		return ErrForbidden
 	}
-	if s.Redis != nil {
-		seconds := 60
-		if g.GroupType == domain.GroupLarge {
-			seconds = 300
-		}
-		// @所有人不展开提醒记录，只用 Redis 做群维度限频，保护大群。
-		key := fmt.Sprintf("rate_limit:mention_all:group:%d", g.ID)
-		ok, err := s.Redis.SetNX(ctx, key, "1", time.Duration(seconds)*time.Second).Result()
-		if err == nil && !ok {
-			return ErrRateLimited
-		}
+	seconds := 60
+	if g.GroupType == domain.GroupLarge {
+		seconds = 300
+	}
+	groupKey := fmt.Sprintf("rate_limit:group:%d:mention_all", g.ID)
+	ok, err := s.useSetNXRateLimit(ctx, groupKey, time.Duration(seconds)*time.Second)
+	if err == nil && !ok {
+		return ErrRateLimited
+	}
+	userKey := fmt.Sprintf("rate_limit:user:%d:mention_all", m.UserID)
+	ok, err = s.useSetNXRateLimit(ctx, userKey, time.Duration(seconds)*time.Second)
+	if err == nil && !ok {
+		return ErrRateLimited
 	}
 	return nil
 }
@@ -558,6 +680,14 @@ func (s *Service) outboxFor(ctx context.Context, eventType string, groupID int64
 		return nil
 	}
 	return &domain.OutboxEvent{EventID: eventID, Topic: s.Cfg.KafkaTopic, AggregateID: strconv.FormatInt(groupID, 10), Payload: raw}
+}
+
+func (s *Service) newRealtimeEvent(ctx context.Context, eventType string, groupID int64, groupType string, senderID int64, targetUserIDs []int64, body any) *domain.RealtimeEvent {
+	targetUserIDs = dedupeInt64s(targetUserIDs)
+	evt := &domain.RealtimeEvent{EventType: eventType, GroupID: groupID, GroupType: groupType, SenderID: senderID, TargetUserIDs: targetUserIDs, Body: body}
+	payload := map[string]any{"targetUserIds": targetUserIDs, "body": body}
+	evt.Outbox = s.outboxFor(ctx, eventType, groupID, groupType, "", 0, senderID, payload)
+	return evt
 }
 
 // RunOutboxRelay 后台轮询 message_outbox，将待发事件可靠投递到 Kafka。仅在 Kafka 开启时运行，阻塞至 ctx 取消。
@@ -630,9 +760,105 @@ func (s *Service) requireRole(ctx context.Context, groupID, userID int64, action
 	return nil
 }
 
+func (s *Service) listOwnerAndAdminIDs(ctx context.Context, groupID int64) ([]int64, error) {
+	return s.Repo.ListOwnerAndAdminIDs(ctx, groupID)
+}
+
+func groupConfigCacheKey(groupID int64) string {
+	return fmt.Sprintf("group:%d:config", groupID)
+}
+
+func marshalGroupConfigCacheValue(group *domain.Group) ([]byte, error) {
+	return json.Marshal(group)
+}
+
+func (s *Service) invalidateGroupConfigCache(ctx context.Context, groupID int64) error {
+	if s.groupConfigDel != nil {
+		return s.groupConfigDel(ctx, groupConfigCacheKey(groupID))
+	}
+	if s.Redis == nil {
+		return nil
+	}
+	if err := s.Redis.Del(ctx, groupConfigCacheKey(groupID)).Err(); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) cacheGroupConfig(ctx context.Context, group *domain.Group) {
+	if group == nil {
+		return
+	}
+	payload, err := marshalGroupConfigCacheValue(group)
+	if err != nil {
+		return
+	}
+	key := groupConfigCacheKey(group.ID)
+	if s.groupConfigSet != nil {
+		_ = s.groupConfigSet(ctx, key, payload, 10*time.Minute)
+		return
+	}
+	if s.Redis == nil {
+		return
+	}
+	_ = s.Redis.Set(ctx, key, payload, 10*time.Minute).Err()
+}
+
+func (s *Service) getGroupConfig(ctx context.Context, groupID int64) (*domain.Group, error) {
+	key := groupConfigCacheKey(groupID)
+	if s.groupConfigGet != nil {
+		if raw, err := s.groupConfigGet(ctx, key); err == nil {
+			var group domain.Group
+			if err := json.Unmarshal(raw, &group); err == nil {
+				return &group, nil
+			}
+		} else if !errors.Is(err, redis.Nil) {
+			logx.From(ctx).Warn("group_config_cache_read_failed", zap.String("event", "group_config_cache_read_failed"), zap.Int64("groupId", groupID), zap.Error(err))
+		}
+	} else if s.Redis != nil {
+		if raw, err := s.Redis.Get(ctx, key).Bytes(); err == nil {
+			var group domain.Group
+			if err := json.Unmarshal(raw, &group); err == nil {
+				return &group, nil
+			}
+		} else if !errors.Is(err, redis.Nil) {
+			logx.From(ctx).Warn("group_config_cache_read_failed", zap.String("event", "group_config_cache_read_failed"), zap.Int64("groupId", groupID), zap.Error(err))
+		}
+	}
+	fetch := s.groupConfigFetch
+	if fetch == nil {
+		fetch = s.Repo.GetGroup
+	}
+	group, err := fetch(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	s.cacheGroupConfig(ctx, group)
+	return group, nil
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1
 	}
 	return 0
+}
+
+func dedupeInt64s(in []int64) []int64 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(in))
+	seen := make(map[int64]struct{}, len(in))
+	for _, v := range in {
+		if v <= 0 {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }

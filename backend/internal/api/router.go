@@ -291,8 +291,8 @@ func (r *Router) joinGroup(c *gin.Context) {
 		return
 	}
 	r.pushIfDirect(c.Request.Context(), result.Message)
-	if result.Pending {
-		r.pushEventIfDirect(c.Request.Context(), gid, "group_join_request_created", result.Request)
+	if result.RealtimeEvent != nil {
+		r.pushRealtimeEventIfDirect(c.Request.Context(), result.RealtimeEvent)
 	}
 	OK(c, toJoinGroupResponse(result))
 }
@@ -424,13 +424,13 @@ func (r *Router) setRole(c *gin.Context) {
 func (r *Router) kickMember(c *gin.Context) {
 	gid, _ := paramInt(c, "groupId")
 	tid, _ := paramInt(c, "userId")
-	msg, err := r.svc.KickMember(c.Request.Context(), gid, uid(c), tid)
+	msg, evt, err := r.svc.KickMember(c.Request.Context(), gid, uid(c), tid)
 	if err != nil {
 		Fail(c, 403, "KICK_FAILED", err.Error())
 		return
 	}
 	r.pushIfDirect(c.Request.Context(), msg)
-	r.hub.SendToUsers([]int64{tid}, "group_member_kicked", gin.H{"groupId": gid, "userId": tid})
+	r.pushRealtimeEventIfDirect(c.Request.Context(), evt)
 	OK(c, gin.H{"kicked": true})
 }
 
@@ -548,8 +548,15 @@ func (r *Router) read(c *gin.Context) {
 	if !bindJSON(c, &req) {
 		return
 	}
-	if err := r.repo.UpdateRead(c.Request.Context(), gid, uid(c), req.LastReadSequence); err != nil {
-		Fail(c, 500, "READ_FAILED", err.Error())
+	if err := r.svc.UpdateReadPosition(c.Request.Context(), gid, uid(c), req.LastReadSequence); err != nil {
+		switch {
+		case errors.Is(err, service.ErrReadSequenceRollback):
+			Fail(c, 400, "READ_SEQUENCE_ROLLBACK", "last read sequence cannot roll back")
+		case errors.Is(err, service.ErrForbidden):
+			Fail(c, 403, "FORBIDDEN", "not group member")
+		default:
+			Fail(c, 500, "READ_FAILED", err.Error())
+		}
 		return
 	}
 	OK(c, gin.H{"lastReadSequence": req.LastReadSequence})
@@ -729,13 +736,13 @@ func (r *Router) joinRequests(c *gin.Context) {
 func (r *Router) approveJoinRequest(c *gin.Context) {
 	gid, _ := paramInt(c, "groupId")
 	rid, _ := paramInt(c, "requestId")
-	jr, msg, err := r.svc.ApproveJoinRequest(c.Request.Context(), gid, uid(c), rid)
+	jr, msg, evt, err := r.svc.ApproveJoinRequest(c.Request.Context(), gid, uid(c), rid)
 	if err != nil {
 		Fail(c, 403, "APPROVE_JOIN_FAILED", err.Error())
 		return
 	}
 	r.pushIfDirect(c.Request.Context(), msg)
-	r.hub.SendToUsers([]int64{jr.UserID}, "group_join_request_approved", jr)
+	r.pushRealtimeEventIfDirect(c.Request.Context(), evt)
 	OK(c, toJoinRequestDTO(*jr))
 }
 
@@ -748,12 +755,12 @@ func (r *Router) approveJoinRequest(c *gin.Context) {
 func (r *Router) rejectJoinRequest(c *gin.Context) {
 	gid, _ := paramInt(c, "groupId")
 	rid, _ := paramInt(c, "requestId")
-	jr, err := r.svc.RejectJoinRequest(c.Request.Context(), gid, uid(c), rid)
+	jr, evt, err := r.svc.RejectJoinRequest(c.Request.Context(), gid, uid(c), rid)
 	if err != nil {
 		Fail(c, 403, "REJECT_JOIN_FAILED", err.Error())
 		return
 	}
-	r.hub.SendToUsers([]int64{jr.UserID}, "group_join_request_rejected", jr)
+	r.pushRealtimeEventIfDirect(c.Request.Context(), evt)
 	OK(c, toJoinRequestDTO(*jr))
 }
 
@@ -811,8 +818,23 @@ func (r *Router) onWSMessage(client *ws.Client, env ws.Envelope) {
 			GroupID          int64 `json:"groupId"`
 			LastReadSequence int64 `json:"lastReadSequence"`
 		}
-		_ = json.Unmarshal(env.Data, &req)
-		_ = r.repo.UpdateRead(ctx, req.GroupID, client.UserID, req.LastReadSequence)
+		if err := json.Unmarshal(env.Data, &req); err != nil {
+			client.SendJSON("error", env.RequestID, gin.H{"code": "BAD_REQUEST", "message": err.Error(), "retryable": false})
+			return
+		}
+		if err := r.svc.UpdateReadPosition(ctx, req.GroupID, client.UserID, req.LastReadSequence); err != nil {
+			code := "READ_FAILED"
+			retryable := true
+			if errors.Is(err, service.ErrReadSequenceRollback) {
+				code = "READ_SEQUENCE_ROLLBACK"
+				retryable = false
+			} else if errors.Is(err, service.ErrForbidden) {
+				code = "FORBIDDEN"
+				retryable = false
+			}
+			client.SendJSON("error", env.RequestID, gin.H{"code": code, "message": err.Error(), "groupId": req.GroupID, "retryable": retryable})
+			return
+		}
 		client.SendJSON("group_message_read_ack", env.RequestID, gin.H{"groupId": req.GroupID, "lastReadSequence": req.LastReadSequence})
 	default:
 		client.SendJSON("error", env.RequestID, gin.H{"code": "UNKNOWN_TYPE", "message": "unknown message type", "retryable": false})
@@ -851,6 +873,13 @@ func (r *Router) pushEventIfDirect(ctx context.Context, groupID int64, eventType
 	r.hub.SendToUsers(ids, eventType, payload)
 }
 
+func (r *Router) pushRealtimeEventIfDirect(ctx context.Context, evt *domain.RealtimeEvent) {
+	if evt == nil || r.cfg.KafkaEnabled {
+		return
+	}
+	r.hub.SendToUsers(evt.TargetUserIDs, evt.EventType, evt.Body)
+}
+
 func (r *Router) memberIDs(ctx context.Context, gid int64) []int64 {
 	out := []int64{}
 	var cursor int64
@@ -881,10 +910,20 @@ func (r *Router) internalPush(c *gin.Context) {
 	if req.Type == "" {
 		req.Type = "group_message_receive"
 	}
-	n := r.hub.SendToUsers(req.UserIDs, req.Type, data)
+	targetUserCount := len(req.UserIDs)
+	targetConnectionCount := len(req.ConnectionIDs)
+	n := 0
+	failedCount := 0
+	if len(req.ConnectionIDs) > 0 {
+		n = r.hub.SendToConnections(req.ConnectionIDs, req.Type, data)
+		failedCount = len(req.ConnectionIDs) - n
+	} else {
+		n = r.hub.SendToUsers(req.UserIDs, req.Type, data)
+	}
 	logx.From(c.Request.Context()).Info("ws_push",
 		zap.String("event", "ws_push"), zap.String("type", req.Type),
-		zap.String("serverId", r.cfg.ServerID), zap.Int("targetUserCount", len(req.UserIDs)),
-		zap.Int("successCount", n), zap.Int("failedCount", len(req.UserIDs)-n))
+		zap.String("serverId", r.cfg.ServerID), zap.Int("targetUserCount", targetUserCount),
+		zap.Int("targetConnectionCount", targetConnectionCount),
+		zap.Int("successCount", n), zap.Int("failedCount", failedCount))
 	OK(c, gin.H{"pushed": n})
 }

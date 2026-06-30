@@ -1451,3 +1451,75 @@ GroupFlow WebSocket 协议的核心是：
 12. 离线用户不走 WebSocket 实时投递，上线后通过历史消息补拉。
 
 该协议可以支撑 GroupFlow 一期群聊闭环，也为后续大群、多端同步、消息类型扩展和分布式投递预留了空间。
+
+------
+
+## 31. 代码实现对齐说明（与当前实现核对）
+
+> 本节按当前后端代码实际实现核对上文协议，作为文档与代码之间的权威对照。
+
+### 31.1 连接握手
+
+- 连接成功后服务端立即下发 `connection_connected`，data 含
+  `connectionId / userId / serverId / heartbeatIntervalSeconds(20) /
+  heartbeatTimeoutSeconds(60) / protocolVersion("v1")`。
+- 统一信封字段：`type / version("v1") / requestId / traceId(可选) / timestamp / data`。
+  `Build` 始终写入 `version:"v1"` 与毫秒 `timestamp`。
+
+### 31.2 当前实际处理的入站消息类型
+
+服务端入站仅处理以下三类，其余一律回 `error` / `UNKNOWN_TYPE`：
+
+| 入站 type | 处理 |
+| --- | --- |
+| `ping` | 在读循环内处理：续期 Redis 在线态，回 `pong`（含 `serverTime`） |
+| `group_message_send` | 校验+落库+生成事件，回 `group_message_ack` 或 `group_message_failed` |
+| `group_message_read` | 已读位置上报，含回退校验（见 31.4） |
+
+- 协议层另有 WebSocket PING 帧（每 30s）与 PongHandler（重置 70s 读超时 + 续期）。
+
+### 31.3 已读上报：错误以 `error` 信封返回
+
+- `group_message_read` 入站字段：`groupId / lastReadSequence`。
+- 成功 → `group_message_read_ack`（`{groupId, lastReadSequence}`）。
+- 失败统一以 `type:"error"` 返回（**没有** `group_message_read_failed` 类型）：
+  - JSON 解析失败 → `code:"BAD_REQUEST"`，`retryable:false`。
+  - 已读回退（lastRead < 当前）→ `code:"READ_SEQUENCE_ROLLBACK"`，`retryable:false`，含 `groupId`。
+  - 非群成员 / 已退群 / 已被踢 → `code:"FORBIDDEN"`，`retryable:false`。
+  - 其它错误 → `code:"READ_FAILED"`，`retryable:true`。
+- 相等 sequence 为幂等 no-op，直接成功。
+- HTTP `POST /groups/:groupId/read` 同源映射：回退 → 400 `READ_SEQUENCE_ROLLBACK`，
+  非成员 → 403 `FORBIDDEN`，其它 → 500 `READ_FAILED`。
+
+### 31.4 发送失败错误码（当前代码）
+
+`group_message_send` 失败时 code 取自 `codeFromErr`：
+`GROUP_MUTED` / `SLOW_MODE_LIMITED` / `FORBIDDEN` / `MESSAGE_SEND_FAILED`；
+JSON 解析失败为 `BAD_REQUEST`。`retryable` 由错误类型决定。
+
+### 31.5 内部推送接口（Delivery → WS 节点）
+
+- 实际路径为 **`POST /internal/push`**（不是文档示例的 `/internal/ws/push`）。
+- 请求体字段：`userIds`（兼容）/ `connectionIds`（优先）/ `type`（缺省
+  `group_message_receive`）/ `data`。`connectionIds` 非空时按连接精确下发，
+  否则回落按 `userIds` 下发。
+- 响应体：`{ "data": { "pushed": N } }`。
+- Delivery 投递时**始终发送 `connectionIds`**（不发 userIds/targetUserIds），
+  并透传 `X-Trace-Id`。
+
+### 31.6 结构化群事件（Kafka 模式）
+
+- 这些事件经 Outbox → Kafka → Delivery，按事件体内 `targetUserIds` 定向推送，
+  WS 下发的 `type` 等于事件类型本身：
+  `group_member_kicked / group_join_request_created /
+  group_join_request_approved / group_join_request_rejected`。
+- Kafka 关闭（direct 模式）时由 router 本地直推；Kafka 开启时 router 直推短路，
+  统一走 Delivery，避免双发。
+
+### 31.7 未实现 / 暂缺
+
+- `connection_kicked`（按连接踢下线并主动断开）**未实现**。
+- `group_member_joined/left` 等二期结构化事件未单独实现为 WS 协议事件
+  （加入/退出当前以系统文本消息 `group_message_receive(system)` 形式下发）。
+- 多端跨节点投递已支持：投递按 `online:user:{uid}:connections` →
+  `connection:{cid}:server` 解析，按 serverId 分组后分别推送到各 WS 节点。

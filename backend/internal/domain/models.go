@@ -181,6 +181,16 @@ type RecallEvent struct {
 	RecalledAt time.Time `json:"recalledAt"`
 }
 
+type RealtimeEvent struct {
+	EventType     string       `json:"eventType"`
+	GroupID       int64        `json:"groupId"`
+	GroupType     string       `json:"groupType"`
+	SenderID      int64        `json:"senderId"`
+	TargetUserIDs []int64      `json:"targetUserIds"`
+	Body          any          `json:"body"`
+	Outbox        *OutboxEvent `json:"-"`
+}
+
 type Page[T any] struct {
 	Items      []T    `json:"items"`
 	NextCursor string `json:"nextCursor"`

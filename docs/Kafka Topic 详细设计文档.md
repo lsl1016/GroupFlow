@@ -1533,3 +1533,99 @@ GroupFlow Kafka Topic 设计的核心是：
 10. 后续可以引入热点群独立 Topic、Retry Topic、DLQ 和 Outbox。
 11. 事件必须包含 eventId、eventType、traceId、groupId、occurredAt 和 payload。
 12. 客户端最终仍然依赖 messageId 去重、sequence 排序和历史消息补拉来保证体验一致性。
+
+------
+
+# 29. 代码实现对齐说明（与当前实现核对）
+
+> 本节按当前后端代码实际实现核对上文设计，作为文档与代码之间的权威对照。
+
+## 29.1 Topic 与消费者组
+
+- **当前只使用单个 Topic**，由配置 `KAFKA_GROUP_MESSAGE_TOPIC` 决定，默认
+  `group-message-topic`。生产者、消费者、Outbox 行的 topic 字段全部指向这一个 topic。
+- 消费者组：`KAFKA_CONSUMER_GROUP`，默认 `groupflow-delivery`。
+- Brokers：`KAFKA_BROKERS`，默认 `localhost:9092`。
+- 开关：`KAFKA_ENABLED`，默认 `false`；关闭时不写 Outbox、不跑 relay/consumer，
+  由 router 直推（direct 模式）。
+- **未拆分** `group-system-event-topic` / `group-message-large-topic` /
+  `group-message-hot-topic` 等：群系统/结构化事件复用同一个 topic，通过 `eventType` 区分。
+
+## 29.2 事件信封（实际产生结构）
+
+由 `service.outboxFor` 生成的信封 JSON 字段（顺序）：
+
+```json
+{
+  "eventId": "evt_...",
+  "eventType": "...",
+  "traceId": "...",
+  "groupId": 10001,
+  "groupType": "large",
+  "messageId": "msg_...",
+  "sequence": 100201,
+  "senderId": 1001,
+  "occurredAt": "RFC3339Nano",
+  "payload": { ... }
+}
+```
+
+- 非消息类事件 `messageId` 为空串、`sequence` 为 0。
+- 消费端 `groupEvent` 只解码 `eventId/eventType/traceId/groupId/groupType/messageId/sequence/payload`，
+  `senderId` 与 `occurredAt` 产生但消费时未使用。
+- 信封中**没有** `version` 字段（与 §21 建议不同，目前未引入版本字段）。
+
+## 29.3 实际产生并消费的 eventType（生产=消费，共 6 种）
+
+| eventType | 生产 | 消费分支 |
+| --- | --- | --- |
+| `group_message_created` | SendGroupMessage / createSystemMessage | fanout → WS `group_message_receive` |
+| `group_message_recalled` | RecallMessage | fanout → WS `group_message_recalled` |
+| `group_member_kicked` | KickMember | handleStructuredEvent（按 targetUserIds） |
+| `group_join_request_created` | JoinGroup（审批模式） | handleStructuredEvent |
+| `group_join_request_approved` | ApproveJoinRequest | handleStructuredEvent |
+| `group_join_request_rejected` | RejectJoinRequest | handleStructuredEvent |
+
+- 群消息/撤回走 `fanout`（枚举全量活跃成员后过滤在线连接）。
+- 四类结构化事件走 `handleStructuredEvent`，payload 形如
+  `{ "targetUserIds": [...], "body": <事件体> }`，只推给 targetUserIds 对应的在线连接。
+- 未知 eventType：记 `ignore_unknown_event` 日志并提交（视为已处理）。
+
+## 29.4 分区 Key
+
+- 分区 Key = `groupId` 的字符串形式（`OutboxEvent.AggregateID`），
+  生产时作为 `kafka.Message.Key`，配合 `&kafka.Hash{}` balancer 保证同群进同分区、群内有序。
+
+## 29.5 Producer 配置（当前代码）
+
+- `RequiredAcks = kafka.RequireOne`（**仅 leader ack**，非文档 §19.2 建议的 `all`）。
+- `Balancer = &kafka.Hash{}`。
+- `BatchTimeout = 10ms`。
+- 未设置显式 compression / retries / request_timeout。
+- Kafka 关闭时使用 `NoopProducer`（Produce 为空操作）。
+
+## 29.6 Consumer 提交语义（重试后成功才提交）
+
+- 使用 `FetchMessage` 手动拉取，`processMessage` 包裹处理：
+  - 重试退避序列 `{0, 50ms, 100ms}`，**共 3 次尝试**。
+  - **仅在处理成功后才提交 offset**；3 次都失败则不提交、记错误日志，进入下一条。
+  - Reader `CommitInterval = 1s`，提交为异步刷新。
+- 失败消息没有 DLQ 去向；未提交的 offset 在重启/重平衡后会被重新拉取。
+
+## 29.7 Outbox（事务消息表）— 已实现
+
+- 写侧：`insertOutboxTx` 在业务写入的**同一 MySQL 事务**内写 `message_outbox`
+  （InsertMessage / RecallMessage / MarkMemberStatus / CreateJoinRequest /
+  ApproveJoinRequest / RejectJoinRequest 均接入），保证“消息已存储 ⇔ 事件已入队”。
+- relay：`RunOutboxRelay` 每 **500ms** 轮询 `drainOutbox`，仅在 Kafka 开启且 Producer 非空时运行。
+- 认领：`ClaimPendingOutbox` 用 `FOR UPDATE SKIP LOCKED` 原子认领，置 `sending` 并设
+  30s 租约（崩溃可被重新认领）；成功 `MarkOutboxSent`，失败 `MarkOutboxRetry`
+  指数退避（`1<<retry` 秒，封顶 60s）。状态：`pending→sending→sent/failed`。
+
+## 29.8 与原设计的主要差异（待演进项）
+
+- 未实现独立 DLQ topic / Retry topic；失败重试由「Outbox 行 next_retry_at 退避」+
+  「消费端 3 次内存重试」两层完成，无死信去向。
+- Producer 仍为 `RequireOne`（可后续改 `acks=all` 提升可靠性）。
+- 信封未引入 `version` 字段。
+- 未拆分 system-event / large / hot 专用 topic。

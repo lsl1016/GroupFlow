@@ -347,7 +347,7 @@ func (r *Repository) UpdateMemberRole(ctx context.Context, groupID, userID int64
 	return dbErr(ctx, "update_member_role", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.String("role", role))
 }
 
-func (r *Repository) MarkMemberStatus(ctx context.Context, groupID, userID int64, status string) error {
+func (r *Repository) MarkMemberStatus(ctx context.Context, groupID, userID int64, status string, ob *domain.OutboxEvent) error {
 	t := now()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -359,6 +359,9 @@ func (r *Repository) MarkMemberStatus(ctx context.Context, groupID, userID int64
 		return dbErr(ctx, "mark_member_status_update", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.String("status", status))
 	}
 	_, _ = tx.ExecContext(ctx, `UPDATE chat_group SET member_count=(SELECT COUNT(*) FROM group_member WHERE group_id=? AND status='normal'), updated_at=? WHERE id=?`, groupID, t, groupID)
+	if err := insertOutboxTx(ctx, tx, ob, t); err != nil {
+		return dbErr(ctx, "mark_member_status_outbox", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.String("status", status))
+	}
 	if err := tx.Commit(); err != nil {
 		return dbErr(ctx, "mark_member_status_commit", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 	}
@@ -555,6 +558,24 @@ func (r *Repository) UpdateRead(ctx context.Context, groupID, userID, lastRead i
 	return nil
 }
 
+type memberIDRow struct {
+	rowID  int64
+	userID int64
+}
+
+func paginateActiveMemberIDs(rows []memberIDRow, limit int) ([]int64, int64) {
+	ids := make([]int64, 0, limit)
+	var next int64
+	for i, row := range rows {
+		if i >= limit {
+			next = rows[limit-1].rowID
+			break
+		}
+		ids = append(ids, row.userID)
+	}
+	return ids, next
+}
+
 func (r *Repository) ListActiveMemberIDs(ctx context.Context, groupID int64, cursor int64, limit int) ([]int64, int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 1000
@@ -565,20 +586,19 @@ func (r *Repository) ListActiveMemberIDs(ctx context.Context, groupID int64, cur
 		return nil, 0, dbErr(ctx, "list_active_member_ids", err, zap.Int64("groupId", groupID), zap.Int64("cursor", cursor))
 	}
 	defer rows.Close()
-	ids := make([]int64, 0, limit)
-	var next int64
+	memberRows := make([]memberIDRow, 0, limit+1)
 	for rows.Next() {
-		var rowID, userID int64
-		if err := rows.Scan(&rowID, &userID); err != nil {
+		var row memberIDRow
+		if err := rows.Scan(&row.rowID, &row.userID); err != nil {
 			return nil, 0, err
 		}
-		if len(ids) >= limit {
-			next = rowID
-			break
-		}
-		ids = append(ids, userID)
+		memberRows = append(memberRows, row)
 	}
-	return ids, next, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	ids, next := paginateActiveMemberIDs(memberRows, limit)
+	return ids, next, nil
 }
 
 func scanAnnouncement(scanner interface{ Scan(dest ...any) error }) (*domain.Announcement, error) {
@@ -726,20 +746,37 @@ func scanJoinRequest(scanner interface{ Scan(dest ...any) error }) (*domain.Join
 
 const joinReqCols = `jr.id,jr.group_id,jr.user_id,u.username,u.nickname,u.avatar,jr.reason,jr.status,jr.operator_id,jr.created_at,jr.updated_at`
 
-func (r *Repository) CreateJoinRequest(ctx context.Context, groupID, userID int64, reason string) (*domain.JoinRequest, error) {
+func (r *Repository) CreateJoinRequest(ctx context.Context, groupID, userID int64, reason string, buildOutbox func(*domain.JoinRequest) *domain.OutboxEvent) (*domain.JoinRequest, error) {
 	if pending, err := r.GetPendingJoinRequest(ctx, groupID, userID); err == nil {
 		return pending, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	t := now()
-	res, err := r.db.ExecContext(ctx, `INSERT INTO group_join_request(group_id,user_id,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?)`, groupID, userID, reason, domain.JoinPending, t, t)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, dbErr(ctx, "create_join_request_begin_tx", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `INSERT INTO group_join_request(group_id,user_id,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?)`, groupID, userID, reason, domain.JoinPending, t, t)
 	if err != nil {
 		return nil, dbErr(ctx, "create_join_request", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 	}
 	id, _ := res.LastInsertId()
+	jr, err := scanJoinRequest(tx.QueryRowContext(ctx, `SELECT `+joinReqCols+` FROM group_join_request jr JOIN user_account u ON jr.user_id=u.id WHERE jr.group_id=? AND jr.id=? LIMIT 1`, groupID, id))
+	if err != nil {
+		return nil, dbErr(ctx, "create_join_request_get_created", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.Int64("requestId", id))
+	}
+	if buildOutbox != nil {
+		if err := insertOutboxTx(ctx, tx, buildOutbox(jr), t); err != nil {
+			return nil, dbErr(ctx, "create_join_request_outbox", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, dbErr(ctx, "create_join_request_commit", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
+	}
 	logx.From(ctx).Info("db_join_request_created", zap.String("event", "db_join_request_created"), zap.Int64("groupId", groupID), zap.Int64("userId", userID), zap.Int64("requestId", id))
-	return r.GetJoinRequest(ctx, groupID, id)
+	return jr, nil
 }
 
 func (r *Repository) GetPendingJoinRequest(ctx context.Context, groupID, userID int64) (*domain.JoinRequest, error) {
@@ -782,7 +819,7 @@ func (r *Repository) ListJoinRequests(ctx context.Context, groupID int64, cursor
 	return &domain.Page[domain.JoinRequest]{Items: items, NextCursor: next, HasMore: next != ""}, rows.Err()
 }
 
-func (r *Repository) ApproveJoinRequest(ctx context.Context, groupID, requestID, operatorID int64) (*domain.JoinRequest, error) {
+func (r *Repository) ApproveJoinRequest(ctx context.Context, groupID, requestID, operatorID int64, buildOutbox func(*domain.JoinRequest) *domain.OutboxEvent) (*domain.JoinRequest, error) {
 	t := now()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -803,24 +840,71 @@ func (r *Repository) ApproveJoinRequest(ctx context.Context, groupID, requestID,
 	}
 	_, _ = tx.ExecContext(ctx, `UPDATE chat_group SET member_count=(SELECT COUNT(*) FROM group_member WHERE group_id=? AND status='normal'), updated_at=? WHERE id=?`, groupID, t, groupID)
 	_, _ = tx.ExecContext(ctx, `INSERT INTO group_operation_log(group_id,operator_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?,?)`, groupID, operatorID, userID, "join_request_approve", jsonRaw(map[string]any{"requestId": requestID}), t)
+	jr, err := scanJoinRequest(tx.QueryRowContext(ctx, `SELECT `+joinReqCols+` FROM group_join_request jr JOIN user_account u ON jr.user_id=u.id WHERE jr.group_id=? AND jr.id=? LIMIT 1`, groupID, requestID))
+	if err != nil {
+		return nil, dbErr(ctx, "approve_join_get_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+	}
+	if buildOutbox != nil {
+		if err := insertOutboxTx(ctx, tx, buildOutbox(jr), t); err != nil {
+			return nil, dbErr(ctx, "approve_join_outbox", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, dbErr(ctx, "approve_join_commit", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
 	}
 	logx.From(ctx).Info("db_join_request_approved", zap.String("event", "db_join_request_approved"), zap.Int64("groupId", groupID), zap.Int64("requestId", requestID), zap.Int64("userId", userID), zap.Int64("operatorId", operatorID))
-	return r.GetJoinRequest(ctx, groupID, requestID)
+	return jr, nil
 }
 
-func (r *Repository) RejectJoinRequest(ctx context.Context, groupID, requestID, operatorID int64) (*domain.JoinRequest, error) {
+func (r *Repository) RejectJoinRequest(ctx context.Context, groupID, requestID, operatorID int64, buildOutbox func(*domain.JoinRequest) *domain.OutboxEvent) (*domain.JoinRequest, error) {
 	t := now()
-	_, err := r.db.ExecContext(ctx, `UPDATE group_join_request SET status='rejected', operator_id=?, updated_at=? WHERE group_id=? AND id=? AND status='pending'`, operatorID, t, groupID, requestID)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, dbErr(ctx, "reject_join_begin_tx", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE group_join_request SET status='rejected', operator_id=?, updated_at=? WHERE group_id=? AND id=? AND status='pending'`, operatorID, t, groupID, requestID)
 	if err != nil {
 		return nil, dbErr(ctx, "reject_join_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
 	}
-	jr, err := r.GetJoinRequest(ctx, groupID, requestID)
-	if err == nil {
-		r.CreateOperationLog(ctx, groupID, operatorID, "join_request_reject", map[string]any{"requestId": requestID, "userId": jr.UserID})
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return nil, sql.ErrNoRows
 	}
-	return jr, err
+	var userID int64
+	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM group_join_request WHERE group_id=? AND id=? LIMIT 1`, groupID, requestID).Scan(&userID); err != nil {
+		return nil, dbErr(ctx, "reject_join_select_user", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+	}
+	_, _ = tx.ExecContext(ctx, `INSERT INTO group_operation_log(group_id,operator_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?,?)`, groupID, operatorID, userID, "join_request_reject", jsonRaw(map[string]any{"requestId": requestID, "userId": userID}), t)
+	jr, err := scanJoinRequest(tx.QueryRowContext(ctx, `SELECT `+joinReqCols+` FROM group_join_request jr JOIN user_account u ON jr.user_id=u.id WHERE jr.group_id=? AND jr.id=? LIMIT 1`, groupID, requestID))
+	if err != nil {
+		return nil, dbErr(ctx, "reject_join_get_request", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+	}
+	if buildOutbox != nil {
+		if err := insertOutboxTx(ctx, tx, buildOutbox(jr), t); err != nil {
+			return nil, dbErr(ctx, "reject_join_outbox", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, dbErr(ctx, "reject_join_commit", err, zap.Int64("groupId", groupID), zap.Int64("requestId", requestID))
+	}
+	return jr, nil
+}
+
+func (r *Repository) ListOwnerAndAdminIDs(ctx context.Context, groupID int64) ([]int64, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT gm.user_id FROM group_member gm WHERE gm.group_id=? AND gm.status='normal' AND gm.role IN('owner','admin') ORDER BY gm.user_id ASC`, groupID)
+	if err != nil {
+		return nil, dbErr(ctx, "list_owner_admin_ids", err, zap.Int64("groupId", groupID))
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		ids = append(ids, userID)
+	}
+	return uniqueInt64s(ids), rows.Err()
 }
 
 func scanMention(scanner interface{ Scan(dest ...any) error }) (*domain.Mention, error) {

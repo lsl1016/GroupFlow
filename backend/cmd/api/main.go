@@ -57,6 +57,7 @@ func main() {
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	defer relayCancel()
 	go svc.RunOutboxRelay(relayCtx)
+	go hub.RunHeartbeat(relayCtx)
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: engine, ReadHeaderTimeout: 10 * time.Second}
 	// 后台启动 HTTP 服务，监听失败（非正常关闭）直接退出
 	go func() {
