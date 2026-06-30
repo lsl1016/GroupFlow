@@ -8,22 +8,23 @@ import (
 )
 
 type Config struct {
-	Env             string
-	HTTPAddr        string
-	ServerID        string
-	PublicBaseURL   string
-	MySQLDSN        string
-	RedisAddr       string
-	RedisPassword   string
-	RedisDB         int
-	KafkaEnabled    bool
-	KafkaBrokers    []string
-	KafkaTopic      string
-	KafkaGroup      string
-	AuthSecret      string
-	TokenTTL        time.Duration
-	DirectPush      bool
-	InternalPushURL string
+	Env                string
+	HTTPAddr           string
+	ServerID           string
+	PublicBaseURL      string
+	MySQLDSN           string
+	RedisAddr          string
+	RedisPassword      string
+	RedisDB            int
+	KafkaEnabled       bool
+	KafkaBrokers       []string
+	KafkaTopic         string
+	KafkaGroup         string
+	AuthSecret         string
+	TokenTTL           time.Duration
+	InternalPushURL    string
+	WSAdvertisePushURL string
+	MessageShardCount  int
 
 	LogLevel          string
 	LogFormat         string
@@ -41,6 +42,7 @@ type Config struct {
 func Load() Config {
 	ttlHours := envInt("TOKEN_TTL_HOURS", 168)
 	appEnv := env("APP_ENV", "dev")
+	internalPushURL := env("WS_INTERNAL_PUSH_URL", "http://localhost:8080/internal/push")
 	logFormat := env("LOG_FORMAT", "")
 	if logFormat == "" {
 		if appEnv == "dev" {
@@ -50,22 +52,23 @@ func Load() Config {
 		}
 	}
 	return Config{
-		Env:             appEnv,
-		HTTPAddr:        env("HTTP_ADDR", ":8080"),
-		ServerID:        env("SERVER_ID", "ws-server-01"),
-		PublicBaseURL:   env("PUBLIC_BASE_URL", "http://localhost"),
-		MySQLDSN:        env("MYSQL_DSN", "groupflow:groupflow@tcp(localhost:3306)/groupflow?parseTime=true&loc=Local&charset=utf8mb4"),
-		RedisAddr:       env("REDIS_ADDR", "localhost:6379"),
-		RedisPassword:   env("REDIS_PASSWORD", ""),
-		RedisDB:         envInt("REDIS_DB", 0),
-		KafkaEnabled:    envBool("KAFKA_ENABLED", false),
-		KafkaBrokers:    split(env("KAFKA_BROKERS", "localhost:9092")),
-		KafkaTopic:      env("KAFKA_GROUP_MESSAGE_TOPIC", "group-message-topic"),
-		KafkaGroup:      env("KAFKA_CONSUMER_GROUP", "groupflow-delivery"),
-		AuthSecret:      env("AUTH_SECRET", "groupflow-dev-secret"),
-		TokenTTL:        time.Duration(ttlHours) * time.Hour,
-		DirectPush:      envBool("DIRECT_PUSH_WHEN_KAFKA_DISABLED", true),
-		InternalPushURL: env("WS_INTERNAL_PUSH_URL", "http://localhost:8080/internal/push"),
+		Env:                appEnv,
+		HTTPAddr:           env("HTTP_ADDR", ":8080"),
+		ServerID:           env("SERVER_ID", "ws-server-01"),
+		PublicBaseURL:      env("PUBLIC_BASE_URL", "http://localhost"),
+		MySQLDSN:           env("MYSQL_DSN", "groupflow:groupflow@tcp(localhost:3306)/groupflow?parseTime=true&loc=Local&charset=utf8mb4"),
+		RedisAddr:          env("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:      env("REDIS_PASSWORD", ""),
+		RedisDB:            envInt("REDIS_DB", 0),
+		KafkaEnabled:       envBool("KAFKA_ENABLED", false),
+		KafkaBrokers:       split(env("KAFKA_BROKERS", "localhost:9092")),
+		KafkaTopic:         env("KAFKA_GROUP_MESSAGE_TOPIC", "group-message-topic"),
+		KafkaGroup:         env("KAFKA_CONSUMER_GROUP", "groupflow-delivery"),
+		AuthSecret:         env("AUTH_SECRET", "groupflow-dev-secret"),
+		TokenTTL:           time.Duration(ttlHours) * time.Hour,
+		InternalPushURL:    internalPushURL,
+		WSAdvertisePushURL: env("WS_ADVERTISE_PUSH_URL", internalPushURL),
+		MessageShardCount:  envInt("MESSAGE_SHARD_COUNT", 1),
 
 		LogLevel:          env("LOG_LEVEL", "info"),
 		LogFormat:         logFormat,

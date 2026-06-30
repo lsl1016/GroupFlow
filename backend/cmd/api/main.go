@@ -48,10 +48,15 @@ func main() {
 	log.Info("kafka_producer_initialized", zap.String("event", "kafka_producer_initialized"), zap.Bool("enabled", cfg.KafkaEnabled))
 
 	// 组装各层依赖：repo 数据访问 → service 业务逻辑 → ws 连接管理 → router HTTP 路由
-	r := repo.New(db)
+	r := repo.New(db, cfg.MessageShardCount)
 	svc := service.New(cfg, r, redis, producer, log)
 	hub := ws.NewHub(cfg, redis, log)
 	engine := api.NewRouter(cfg, svc, r, hub, log)
+
+	// 后台启动 Outbox relay：将消息落库事务中写入的待发事件可靠投递到 Kafka（Kafka 关闭时为 no-op）。
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	go svc.RunOutboxRelay(relayCtx)
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: engine, ReadHeaderTimeout: 10 * time.Second}
 	// 后台启动 HTTP 服务，监听失败（非正常关闭）直接退出
 	go func() {

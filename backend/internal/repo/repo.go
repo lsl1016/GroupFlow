@@ -16,10 +16,28 @@ import (
 	"groupflow/backend/pkg/logx"
 )
 
-type Repository struct{ db *sql.DB }
+type Repository struct {
+	db         *sql.DB
+	shardCount int
+}
 
-func New(db *sql.DB) *Repository  { return &Repository{db: db} }
+func New(db *sql.DB, shardCount int) *Repository {
+	if shardCount <= 0 {
+		shardCount = 1
+	}
+	return &Repository{db: db, shardCount: shardCount}
+}
 func (r *Repository) DB() *sql.DB { return r.db }
+
+// messageTable 返回 group_message 的分表名（分表预留）。shardCount<=1 时使用单表，
+// 否则按 group_id 哈希路由到 group_message_NN。表名为内部常量拼接，不含用户输入，无注入风险。
+func (r *Repository) messageTable(groupID int64) string {
+	if r.shardCount <= 1 {
+		return "group_message"
+	}
+	idx := ((groupID % int64(r.shardCount)) + int64(r.shardCount)) % int64(r.shardCount)
+	return fmt.Sprintf("group_message_%02d", idx)
+}
 
 func now() time.Time { return time.Now().Truncate(time.Second) }
 
@@ -379,12 +397,12 @@ func (r *Repository) IsMuted(ctx context.Context, groupID, userID int64) (bool, 
 	return n > 0, dbErr(ctx, "is_muted", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 }
 
-func (r *Repository) FindMessageByClientID(ctx context.Context, senderID int64, clientID string) (*domain.Message, error) {
-	return scanMessage(r.db.QueryRowContext(ctx, `SELECT `+messageCols+` FROM group_message WHERE sender_id=? AND client_message_id=? LIMIT 1`, senderID, clientID))
+func (r *Repository) FindMessageByClientID(ctx context.Context, groupID, senderID int64, clientID string) (*domain.Message, error) {
+	return scanMessage(r.db.QueryRowContext(ctx, `SELECT `+messageCols+` FROM `+r.messageTable(groupID)+` WHERE sender_id=? AND client_message_id=? LIMIT 1`, senderID, clientID))
 }
 
-func (r *Repository) FindMessageByID(ctx context.Context, messageID string) (*domain.Message, error) {
-	return scanMessage(r.db.QueryRowContext(ctx, `SELECT `+messageCols+` FROM group_message WHERE message_id=? LIMIT 1`, messageID))
+func (r *Repository) FindMessageByID(ctx context.Context, groupID int64, messageID string) (*domain.Message, error) {
+	return scanMessage(r.db.QueryRowContext(ctx, `SELECT `+messageCols+` FROM `+r.messageTable(groupID)+` WHERE message_id=? LIMIT 1`, messageID))
 }
 
 const messageCols = `id,message_id,group_id,sequence,sender_id,sender_name,client_message_id,message_type,content,mention_all,mention_user_ids,extra,status,created_at,updated_at`
@@ -412,7 +430,7 @@ func scanMessage(scanner interface{ Scan(dest ...any) error }) (*domain.Message,
 	return m, nil
 }
 
-func (r *Repository) InsertMessage(ctx context.Context, m *domain.Message) error {
+func (r *Repository) InsertMessage(ctx context.Context, m *domain.Message, ob *domain.OutboxEvent) error {
 	defer slowSQL(ctx, "insert_group_message", time.Now(), zap.Int64("groupId", m.GroupID), zap.String("messageId", m.MessageID))
 	mention, _ := json.Marshal(m.MentionUserIDs)
 	extra, _ := json.Marshal(m.Extra)
@@ -424,7 +442,7 @@ func (r *Repository) InsertMessage(ctx context.Context, m *domain.Message) error
 		return dbErr(ctx, "insert_message_begin_tx", err, zap.Int64("groupId", m.GroupID), zap.String("messageId", m.MessageID))
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO group_message(message_id,group_id,sequence,sender_id,sender_name,client_message_id,message_type,content,mention_all,mention_user_ids,extra,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.MessageID, m.GroupID, m.Sequence, m.SenderID, m.SenderName, m.ClientMessageID, m.MessageType, m.Content, boolInt(m.MentionAll), string(mention), string(extra), domain.StatusNormal, t, t)
+	_, err = tx.ExecContext(ctx, `INSERT INTO `+r.messageTable(m.GroupID)+`(message_id,group_id,sequence,sender_id,sender_name,client_message_id,message_type,content,mention_all,mention_user_ids,extra,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.MessageID, m.GroupID, m.Sequence, m.SenderID, m.SenderName, m.ClientMessageID, m.MessageType, m.Content, boolInt(m.MentionAll), string(mention), string(extra), domain.StatusNormal, t, t)
 	if err != nil {
 		return dbErr(ctx, "insert_message_insert", err, zap.Int64("groupId", m.GroupID), zap.String("messageId", m.MessageID), zap.String("clientMessageId", m.ClientMessageID), zap.Int64("sequence", m.Sequence))
 	}
@@ -443,15 +461,29 @@ func (r *Repository) InsertMessage(ctx context.Context, m *domain.Message) error
 		}
 		_, _ = tx.ExecContext(ctx, `INSERT IGNORE INTO group_mention(group_id,message_id,sequence,user_id,mention_type,read_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, m.GroupID, m.MessageID, m.Sequence, uid, domain.MentionUser, 0, t, t)
 	}
+	if err := insertOutboxTx(ctx, tx, ob, t); err != nil {
+		return dbErr(ctx, "insert_message_outbox", err, zap.Int64("groupId", m.GroupID), zap.String("messageId", m.MessageID))
+	}
 	if err := tx.Commit(); err != nil {
 		return dbErr(ctx, "insert_message_commit", err, zap.Int64("groupId", m.GroupID), zap.String("messageId", m.MessageID))
 	}
 	return nil
 }
 
+// insertOutboxTx 在给定事务内写入一条待发 Outbox 事件；ob 为 nil（如 Kafka 关闭）时跳过。
+// 与消息落库同事务提交，保证“消息已存储 ⇔ 事件已入队待发”的原子性。
+func insertOutboxTx(ctx context.Context, tx *sql.Tx, ob *domain.OutboxEvent, t time.Time) error {
+	if ob == nil {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO message_outbox(event_id,topic,aggregate_id,payload,status,retry_count,next_retry_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		ob.EventID, ob.Topic, ob.AggregateID, string(ob.Payload), "pending", 0, t, t, t)
+	return err
+}
+
 func (r *Repository) MaxSequence(ctx context.Context, groupID int64) (int64, error) {
 	var max sql.NullInt64
-	err := r.db.QueryRowContext(ctx, `SELECT MAX(sequence) FROM group_message WHERE group_id=?`, groupID).Scan(&max)
+	err := r.db.QueryRowContext(ctx, `SELECT MAX(sequence) FROM `+r.messageTable(groupID)+` WHERE group_id=?`, groupID).Scan(&max)
 	if err != nil {
 		return 0, dbErr(ctx, "max_sequence", err, zap.Int64("groupId", groupID))
 	}
@@ -466,14 +498,15 @@ func (r *Repository) ListMessages(ctx context.Context, groupID int64, beforeSeq,
 		limit = 50
 	}
 	defer slowSQL(ctx, "list_group_messages", time.Now(), zap.Int64("groupId", groupID), zap.Int("limit", limit))
+	table := r.messageTable(groupID)
 	var rows *sql.Rows
 	var err error
 	if afterSeq > 0 {
-		rows, err = r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM group_message WHERE group_id=? AND sequence>? ORDER BY sequence ASC LIMIT ?`, groupID, afterSeq, limit+1)
+		rows, err = r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM `+table+` WHERE group_id=? AND sequence>? ORDER BY sequence ASC LIMIT ?`, groupID, afterSeq, limit+1)
 	} else if beforeSeq > 0 {
-		rows, err = r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM group_message WHERE group_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?`, groupID, beforeSeq, limit+1)
+		rows, err = r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM `+table+` WHERE group_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?`, groupID, beforeSeq, limit+1)
 	} else {
-		rows, err = r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM group_message WHERE group_id=? ORDER BY sequence DESC LIMIT ?`, groupID, limit+1)
+		rows, err = r.db.QueryContext(ctx, `SELECT `+messageCols+` FROM `+table+` WHERE group_id=? ORDER BY sequence DESC LIMIT ?`, groupID, limit+1)
 	}
 	if err != nil {
 		return nil, dbErr(ctx, "list_messages", err, zap.Int64("groupId", groupID), zap.Int64("beforeSeq", beforeSeq), zap.Int64("afterSeq", afterSeq))
@@ -591,7 +624,16 @@ func (r *Repository) ListAnnouncements(ctx context.Context, groupID, cursor int6
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT a.id,a.group_id,a.operator_id,u.nickname,a.title,a.content,a.pinned,a.status,a.created_at,a.updated_at FROM group_announcement a LEFT JOIN user_account u ON a.operator_id=u.id WHERE a.group_id=? AND a.status='normal' AND a.id>? ORDER BY a.pinned DESC, a.id DESC LIMIT ?`, groupID, cursor, limit+1)
+	// 公告按 置顶优先 + id 倒序（最新在前）展示，游标语义为“取比 cursor 更旧（id 更小）的记录”，
+	// cursor=0 表示从最新开始。每群至多一条置顶（发布/置顶时会取消其它置顶），故置顶项稳定出现在首页。
+	args := []any{groupID}
+	whereCursor := ""
+	if cursor > 0 {
+		whereCursor = " AND a.id<?"
+		args = append(args, cursor)
+	}
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, `SELECT a.id,a.group_id,a.operator_id,u.nickname,a.title,a.content,a.pinned,a.status,a.created_at,a.updated_at FROM group_announcement a LEFT JOIN user_account u ON a.operator_id=u.id WHERE a.group_id=? AND a.status='normal'`+whereCursor+` ORDER BY a.pinned DESC, a.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, dbErr(ctx, "list_announcements", err, zap.Int64("groupId", groupID))
 	}
@@ -801,7 +843,7 @@ func (r *Repository) ListMentions(ctx context.Context, groupID, userID, cursor i
 		whereRead = " AND mt.read_status=0"
 	}
 	args = append(args, limit+1)
-	rows, err := r.db.QueryContext(ctx, `SELECT mt.id,mt.group_id,mt.message_id,mt.sequence,mt.user_id,mt.mention_type,mt.read_status,gm.content,gm.sender_name,mt.created_at,mt.updated_at FROM group_mention mt JOIN group_message gm ON mt.message_id=gm.message_id WHERE mt.group_id=? AND mt.user_id=? AND mt.id>?`+whereRead+` ORDER BY mt.id ASC LIMIT ?`, args...)
+	rows, err := r.db.QueryContext(ctx, `SELECT mt.id,mt.group_id,mt.message_id,mt.sequence,mt.user_id,mt.mention_type,mt.read_status,gm.content,gm.sender_name,mt.created_at,mt.updated_at FROM group_mention mt JOIN `+r.messageTable(groupID)+` gm ON mt.message_id=gm.message_id WHERE mt.group_id=? AND mt.user_id=? AND mt.id>?`+whereRead+` ORDER BY mt.id ASC LIMIT ?`, args...)
 	if err != nil {
 		return nil, dbErr(ctx, "list_mentions", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 	}
@@ -833,14 +875,14 @@ func (r *Repository) MarkMentionsRead(ctx context.Context, groupID, userID, sequ
 	return dbErr(ctx, "mark_mentions_read", err, zap.Int64("groupId", groupID), zap.Int64("userId", userID))
 }
 
-func (r *Repository) RecallMessage(ctx context.Context, msg *domain.Message, operatorID int64, reason string) (*domain.RecallEvent, error) {
+func (r *Repository) RecallMessage(ctx context.Context, msg *domain.Message, operatorID int64, reason string, ob *domain.OutboxEvent) (*domain.RecallEvent, error) {
 	t := now()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, dbErr(ctx, "recall_message_begin_tx", err, zap.Int64("groupId", msg.GroupID), zap.String("messageId", msg.MessageID))
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE group_message SET status='recalled', updated_at=? WHERE group_id=? AND message_id=? AND status <> 'recalled'`, t, msg.GroupID, msg.MessageID)
+	res, err := tx.ExecContext(ctx, `UPDATE `+r.messageTable(msg.GroupID)+` SET status='recalled', updated_at=? WHERE group_id=? AND message_id=? AND status <> 'recalled'`, t, msg.GroupID, msg.MessageID)
 	if err != nil {
 		return nil, dbErr(ctx, "recall_message_update", err, zap.Int64("groupId", msg.GroupID), zap.String("messageId", msg.MessageID))
 	}
@@ -853,6 +895,9 @@ func (r *Repository) RecallMessage(ctx context.Context, msg *domain.Message, ope
 		return nil, dbErr(ctx, "recall_message_insert_record", err, zap.Int64("groupId", msg.GroupID), zap.String("messageId", msg.MessageID))
 	}
 	_, _ = tx.ExecContext(ctx, `INSERT INTO group_operation_log(group_id,operator_id,target_user_id,action,detail,created_at) VALUES(?,?,?,?,?,?)`, msg.GroupID, operatorID, msg.SenderID, "message_recall", jsonRaw(map[string]any{"messageId": msg.MessageID, "sequence": msg.Sequence, "reason": reason}), t)
+	if err := insertOutboxTx(ctx, tx, ob, t); err != nil {
+		return nil, dbErr(ctx, "recall_message_outbox", err, zap.Int64("groupId", msg.GroupID), zap.String("messageId", msg.MessageID))
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, dbErr(ctx, "recall_message_commit", err, zap.Int64("groupId", msg.GroupID), zap.String("messageId", msg.MessageID))
 	}
@@ -874,6 +919,63 @@ func uniqueInt64s(in []int64) []int64 {
 }
 
 func jsonRaw(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+// ClaimPendingOutbox 原子认领一批待发 Outbox 记录：在事务内 FOR UPDATE SKIP LOCKED 选出到期的
+// pending/failed 记录并置为 sending（30s 后可被重新认领），避免多实例 relay 重复投递同一事件。
+func (r *Repository) ClaimPendingOutbox(ctx context.Context, limit int) ([]domain.OutboxRow, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, dbErr(ctx, "claim_outbox_begin_tx", err)
+	}
+	defer tx.Rollback()
+	// 含 'sending'：relay 认领后崩溃的记录会停留在 sending，其 next_retry_at=认领时+30s，
+	// 过期后在此被重新认领，避免事件永久卡死。
+	rows, err := tx.QueryContext(ctx, `SELECT id,event_id,topic,aggregate_id,payload,retry_count FROM message_outbox WHERE status IN('pending','failed','sending') AND (next_retry_at IS NULL OR next_retry_at<=NOW()) ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return nil, dbErr(ctx, "claim_outbox_select", err)
+	}
+	var out []domain.OutboxRow
+	var ids []int64
+	for rows.Next() {
+		var row domain.OutboxRow
+		var payload []byte
+		if err := rows.Scan(&row.ID, &row.EventID, &row.Topic, &row.AggregateID, &payload, &row.RetryCount); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		row.Payload = append([]byte(nil), payload...)
+		out = append(out, row)
+		ids = append(ids, row.ID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	t := now()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE message_outbox SET status='sending', next_retry_at=DATE_ADD(?, INTERVAL 30 SECOND), updated_at=? WHERE id=?`, t, t, id); err != nil {
+			return nil, dbErr(ctx, "claim_outbox_mark_sending", err, zap.Int64("outboxId", id))
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, dbErr(ctx, "claim_outbox_commit", err)
+	}
+	return out, nil
+}
+
+func (r *Repository) MarkOutboxSent(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE message_outbox SET status='sent', updated_at=? WHERE id=?`, now(), id)
+	return dbErr(ctx, "mark_outbox_sent", err, zap.Int64("outboxId", id))
+}
+
+// MarkOutboxRetry 将投递失败的记录退回 failed 并设置下次重试时间（指数退避由调用方计算）。
+func (r *Repository) MarkOutboxRetry(ctx context.Context, id int64, retryCount int, nextRetryAt time.Time) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE message_outbox SET status='failed', retry_count=?, next_retry_at=?, updated_at=? WHERE id=?`, retryCount, nextRetryAt, now(), id)
+	return dbErr(ctx, "mark_outbox_retry", err, zap.Int64("outboxId", id))
+}
 
 func (r *Repository) CreateOperationLog(ctx context.Context, groupID, operatorID int64, action string, detail any) {
 	if _, err := r.db.ExecContext(ctx, `INSERT INTO group_operation_log(group_id,operator_id,action,detail,created_at) VALUES(?,?,?,?,?)`, groupID, operatorID, action, jsonRaw(detail), now()); err != nil {

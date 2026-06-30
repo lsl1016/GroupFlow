@@ -1,6 +1,27 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
+
+// OutboxEvent 是在消息落库事务内写入 message_outbox 的待发事件（事务消息表）。
+type OutboxEvent struct {
+	EventID     string          // 事件唯一 ID，用于幂等去重
+	Topic       string          // 目标 Kafka topic
+	AggregateID string          // 聚合根 ID（群 ID 字符串），作为 Kafka 分区 key 保证群内有序
+	Payload     json.RawMessage // 完整事件信封 JSON，relay 原样投递
+}
+
+// OutboxRow 是 relay 从 message_outbox 取出的待投递记录。
+type OutboxRow struct {
+	ID          int64
+	EventID     string
+	Topic       string
+	AggregateID string
+	Payload     json.RawMessage
+	RetryCount  int
+}
 
 const (
 	RoleOwner  = "owner"

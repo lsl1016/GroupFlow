@@ -130,6 +130,8 @@ func (h *Hub) renewRedis(ctx context.Context, c *Client) {
 	pipe.Set(ctx, fmt.Sprintf("connection:%s:server", c.ID), h.cfg.ServerID, 90*time.Second)
 	pipe.SAdd(ctx, fmt.Sprintf("server:%s:connections", h.cfg.ServerID), c.ID)
 	pipe.Expire(ctx, fmt.Sprintf("server:%s:connections", h.cfg.ServerID), 90*time.Second)
+	// 广播本节点的内部推送地址，供 Delivery 按 online:user→serverId 将消息路由到用户所在的 WS 节点。
+	pipe.Set(ctx, fmt.Sprintf("server:%s:push_url", h.cfg.ServerID), h.cfg.WSAdvertisePushURL, 90*time.Second)
 	_, _ = pipe.Exec(ctx)
 }
 

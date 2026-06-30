@@ -96,7 +96,7 @@ func (c *Consumer) handle(ctx context.Context, b []byte) error {
 			_ = json.Unmarshal(evt.Payload, &msg)
 		}
 		if msg.MessageID == "" {
-			m, err := c.repo.FindMessageByID(ctx, evt.MessageID)
+			m, err := c.repo.FindMessageByID(ctx, evt.GroupID, evt.MessageID)
 			if err != nil {
 				return err
 			}
@@ -120,39 +120,51 @@ func (c *Consumer) fanout(ctx context.Context, evt groupEvent, wsType string, pa
 	batchSize := 500
 	var cursor int64
 	var fanoutCount, onlineCount, successCount, failedCount, notFoundCount int
+	urlCache := map[string]string{}
 	for {
 		memberIDs, next, err := c.repo.ListActiveMemberIDs(ctx, groupID, cursor, 1000)
 		if err != nil {
 			return err
 		}
 		fanoutCount += len(memberIDs)
-		online := c.filterOnline(ctx, memberIDs)
-		onlineCount += len(online)
-		notFoundCount += len(memberIDs) - len(online)
-		for i := 0; i < len(online); i += batchSize {
-			end := i + batchSize
-			if end > len(online) {
-				end = len(online)
+		// 按用户所在 WS 节点（online:user→serverId）分组，分别投递到各节点的内部推送地址，支持多节点部署。
+		routes := c.resolveOnlineRoutes(ctx, memberIDs)
+		pageOnline := 0
+		for serverID, users := range routes {
+			pageOnline += len(users)
+			url, ok := urlCache[serverID]
+			if !ok {
+				url = c.pushURL(ctx, serverID)
+				urlCache[serverID] = url
 			}
-			target := online[i:end]
-			pushed, err := c.push(ctx, target, wsType, payload)
-			if err != nil {
-				failedCount += len(target)
-				logx.From(ctx).Warn("delivery_push_failed",
-					zap.String("event", "delivery_push_failed"), zap.Int64("groupId", groupID),
+			for i := 0; i < len(users); i += batchSize {
+				end := i + batchSize
+				if end > len(users) {
+					end = len(users)
+				}
+				target := users[i:end]
+				pushed, err := c.push(ctx, url, target, wsType, payload)
+				if err != nil {
+					failedCount += len(target)
+					logx.From(ctx).Warn("delivery_push_failed",
+						zap.String("event", "delivery_push_failed"), zap.Int64("groupId", groupID),
+						zap.String("messageId", evt.MessageID), zap.Int64("sequence", evt.Sequence),
+						zap.String("serverId", serverID), zap.String("pushUrl", url),
+						zap.Int("targetUserCount", len(target)),
+						zap.String("reason", err.Error()), zap.Bool("retryable", true))
+					continue
+				}
+				successCount += pushed
+				failedCount += len(target) - pushed
+				logx.From(ctx).Info("delivery_push_task",
+					zap.String("event", "delivery_push_task"), zap.Int64("groupId", groupID),
 					zap.String("messageId", evt.MessageID), zap.Int64("sequence", evt.Sequence),
-					zap.String("serverId", c.cfg.ServerID), zap.Int("targetUserCount", len(target)),
-					zap.String("reason", err.Error()), zap.Bool("retryable", true))
-				continue
+					zap.String("serverId", serverID), zap.Int("targetUserCount", len(target)),
+					zap.Int("successCount", pushed), zap.Int("failedCount", len(target)-pushed))
 			}
-			successCount += pushed
-			failedCount += len(target) - pushed
-			logx.From(ctx).Info("delivery_push_task",
-				zap.String("event", "delivery_push_task"), zap.Int64("groupId", groupID),
-				zap.String("messageId", evt.MessageID), zap.Int64("sequence", evt.Sequence),
-				zap.Int("targetUserCount", len(target)), zap.Int("successCount", pushed),
-				zap.Int("failedCount", len(target)-pushed))
 		}
+		onlineCount += pageOnline
+		notFoundCount += len(memberIDs) - pageOnline
 		if next == 0 {
 			break
 		}
@@ -168,10 +180,13 @@ func (c *Consumer) fanout(ctx context.Context, evt groupEvent, wsType string, pa
 	return nil
 }
 
-// filterOnline filters the given userIDs and returns only those who are currently online.
-func (c *Consumer) filterOnline(ctx context.Context, userIDs []int64) []int64 {
+// resolveOnlineRoutes 按 online:user:%d 记录的 serverId 把在线用户分组到各自所在的 WS 节点；
+// 离线用户（无记录）被跳过。无 Redis 时退化为单节点（key ""，使用默认内部推送地址）。
+func (c *Consumer) resolveOnlineRoutes(ctx context.Context, userIDs []int64) map[string][]int64 {
+	routes := map[string][]int64{}
 	if c.redis == nil {
-		return userIDs
+		routes[""] = append([]int64(nil), userIDs...)
+		return routes
 	}
 	pipe := c.redis.Pipeline()
 	cmds := make([]*redis.StringCmd, 0, len(userIDs))
@@ -179,23 +194,34 @@ func (c *Consumer) filterOnline(ctx context.Context, userIDs []int64) []int64 {
 		cmds = append(cmds, pipe.Get(ctx, fmt.Sprintf("online:user:%d", uid)))
 	}
 	_, _ = pipe.Exec(ctx)
-	online := make([]int64, 0, len(userIDs))
 	for i, cmd := range cmds {
-		if cmd.Err() == nil && cmd.Val() != "" {
-			online = append(online, userIDs[i])
+		serverID, err := cmd.Result()
+		if err != nil || serverID == "" {
+			continue
 		}
+		routes[serverID] = append(routes[serverID], userIDs[i])
 	}
-	return online
+	return routes
 }
 
-// push 调用 WebSocket 节点内部推送接口，返回实际推送成功的连接数。透传 X-Trace-Id 维持链路。
-func (c *Consumer) push(ctx context.Context, userIDs []int64, wsType string, payload any) (int, error) {
+// pushURL 解析某 WS 节点的内部推送地址（server:%s:push_url）；缺失时回落到配置的默认地址（单节点）。
+func (c *Consumer) pushURL(ctx context.Context, serverID string) string {
+	if c.redis != nil && serverID != "" {
+		if url, err := c.redis.Get(ctx, fmt.Sprintf("server:%s:push_url", serverID)).Result(); err == nil && url != "" {
+			return url
+		}
+	}
+	return c.cfg.InternalPushURL
+}
+
+// push 调用指定 WebSocket 节点的内部推送接口，返回实际推送成功的连接数。透传 X-Trace-Id 维持链路。
+func (c *Consumer) push(ctx context.Context, url string, userIDs []int64, wsType string, payload any) (int, error) {
 	if len(userIDs) == 0 {
 		return 0, nil
 	}
 	data, _ := json.Marshal(payload)
 	body, _ := json.Marshal(map[string]any{"userIds": userIDs, "type": wsType, "data": json.RawMessage(data)})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.InternalPushURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}

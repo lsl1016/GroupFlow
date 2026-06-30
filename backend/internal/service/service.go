@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -341,7 +342,7 @@ func (s *Service) SendGroupMessage(ctx context.Context, in SendMessageInput) (*d
 		return nil, false, errors.New("content required")
 	}
 	// clientMessageId 是发送幂等入口：客户端重试必须复用同一个 ID，服务端查到旧消息就直接返回旧 ACK。
-	if existing, err := s.Repo.FindMessageByClientID(ctx, in.SenderID, in.ClientMessageID); err == nil {
+	if existing, err := s.Repo.FindMessageByClientID(ctx, in.GroupID, in.SenderID, in.ClientMessageID); err == nil {
 		logx.From(ctx).Info("group_message_idempotent_hit",
 			zap.String("event", "group_message_idempotent_hit"), zap.Int64("groupId", in.GroupID),
 			zap.String("messageId", existing.MessageID), zap.String("clientMessageId", in.ClientMessageID),
@@ -387,15 +388,13 @@ func (s *Service) SendGroupMessage(ctx context.Context, in SendMessageInput) (*d
 		return nil, false, opErr(ctx, "send_message_next_sequence", err, zap.Int64("groupId", in.GroupID), zap.Int64("senderId", in.SenderID))
 	}
 	msg := &domain.Message{MessageID: id.New("msg"), GroupID: in.GroupID, Sequence: seq, SenderID: in.SenderID, SenderName: member.Nickname, ClientMessageID: in.ClientMessageID, MessageType: in.MessageType, Content: in.Content, MentionAll: in.MentionAll, MentionUserIDs: in.MentionUserIDs, Extra: in.Extra, Status: domain.StatusNormal}
-	if err := s.Repo.InsertMessage(ctx, msg); err != nil {
-		if existing, qerr := s.Repo.FindMessageByClientID(ctx, in.SenderID, in.ClientMessageID); qerr == nil {
+	// Kafka 开启时把事件写入 Outbox（与消息落库同事务），由 relay 异步可靠投递；Kafka 关闭时由 router 直推。
+	ob := s.outboxFor(ctx, "group_message_created", msg.GroupID, g.GroupType, msg.MessageID, msg.Sequence, msg.SenderID, msg)
+	if err := s.Repo.InsertMessage(ctx, msg, ob); err != nil {
+		if existing, qerr := s.Repo.FindMessageByClientID(ctx, in.GroupID, in.SenderID, in.ClientMessageID); qerr == nil {
 			return existing, true, nil
 		}
 		return nil, false, opErr(ctx, "send_message_insert", err, zap.Int64("groupId", in.GroupID), zap.Int64("senderId", in.SenderID), zap.String("clientMessageId", in.ClientMessageID))
-	}
-	s.setMaxSequence(ctx, in.GroupID, seq)
-	if err := s.PublishEvent(ctx, "group_message_created", msg.GroupID, g.GroupType, msg.MessageID, msg.Sequence, msg.SenderID, msg); err != nil {
-		logx.From(ctx).Warn("kafka_publish_failed", zap.String("event", "kafka_publish_failed"), zap.Error(err), zap.Int64("groupId", in.GroupID), zap.String("messageId", msg.MessageID))
 	}
 	preview, contentLen := logx.ContentPreview(msg.Content)
 	logx.From(ctx).Info("group_message_send_success",
@@ -408,7 +407,7 @@ func (s *Service) SendGroupMessage(ctx context.Context, in SendMessageInput) (*d
 }
 
 func (s *Service) RecallMessage(ctx context.Context, groupID, operatorID int64, messageID, reason string) (*domain.RecallEvent, error) {
-	msg, err := s.Repo.FindMessageByID(ctx, messageID)
+	msg, err := s.Repo.FindMessageByID(ctx, groupID, messageID)
 	if err != nil {
 		return nil, err
 	}
@@ -425,17 +424,19 @@ func (s *Service) RecallMessage(ctx context.Context, groupID, operatorID int64, 
 	if msg.SenderID != operatorID && m.Role != domain.RoleOwner && m.Role != domain.RoleAdmin {
 		return nil, ErrForbidden
 	}
-	evt, err := s.Repo.RecallMessage(ctx, msg, operatorID, reason)
-	if err != nil {
-		return nil, opErr(ctx, "recall_message", err, zap.Int64("groupId", groupID), zap.String("messageId", messageID), zap.Int64("operatorId", operatorID))
-	}
-	logx.From(ctx).Info("message_recalled", zap.String("event", "message_recalled"), zap.Int64("groupId", groupID), zap.String("messageId", msg.MessageID), zap.Int64("sequence", msg.Sequence), zap.Int64("operatorId", operatorID))
 	g, _ := s.Repo.GetGroup(ctx, groupID)
 	gt := domain.GroupNormal
 	if g != nil {
 		gt = g.GroupType
 	}
-	_ = s.PublishEvent(ctx, "group_message_recalled", groupID, gt, msg.MessageID, msg.Sequence, operatorID, evt)
+	// Outbox 负载用已知字段构造撤回事件；RecalledAt 与 DB 落库时间存在亚秒级差异，不影响下游展示。
+	payload := &domain.RecallEvent{GroupID: groupID, MessageID: msg.MessageID, Sequence: msg.Sequence, OperatorID: operatorID, SenderID: msg.SenderID, Reason: reason, RecalledAt: time.Now()}
+	ob := s.outboxFor(ctx, "group_message_recalled", groupID, gt, msg.MessageID, msg.Sequence, operatorID, payload)
+	evt, err := s.Repo.RecallMessage(ctx, msg, operatorID, reason, ob)
+	if err != nil {
+		return nil, opErr(ctx, "recall_message", err, zap.Int64("groupId", groupID), zap.String("messageId", messageID), zap.Int64("operatorId", operatorID))
+	}
+	logx.From(ctx).Info("message_recalled", zap.String("event", "message_recalled"), zap.Int64("groupId", groupID), zap.String("messageId", msg.MessageID), zap.Int64("sequence", msg.Sequence), zap.Int64("operatorId", operatorID))
 	return evt, nil
 }
 
@@ -445,31 +446,45 @@ func (s *Service) createSystemMessage(ctx context.Context, groupID, operatorID i
 		return nil, opErr(ctx, "system_message_next_sequence", err, zap.Int64("groupId", groupID))
 	}
 	msg := &domain.Message{MessageID: id.New("msg"), GroupID: groupID, Sequence: seq, SenderID: 0, SenderName: "系统", ClientMessageID: id.New("system"), MessageType: domain.MessageSystem, Content: content, Extra: extra, Status: domain.StatusNormal}
-	if err := s.Repo.InsertMessage(ctx, msg); err != nil {
-		return nil, opErr(ctx, "system_message_insert", err, zap.Int64("groupId", groupID), zap.String("messageId", msg.MessageID))
-	}
-	s.setMaxSequence(ctx, groupID, seq)
 	g, _ := s.Repo.GetGroup(ctx, groupID)
 	gt := domain.GroupNormal
 	if g != nil {
 		gt = g.GroupType
 	}
-	_ = s.PublishEvent(ctx, "group_message_created", msg.GroupID, gt, msg.MessageID, msg.Sequence, msg.SenderID, msg)
+	ob := s.outboxFor(ctx, "group_message_created", msg.GroupID, gt, msg.MessageID, msg.Sequence, msg.SenderID, msg)
+	if err := s.Repo.InsertMessage(ctx, msg, ob); err != nil {
+		return nil, opErr(ctx, "system_message_insert", err, zap.Int64("groupId", groupID), zap.String("messageId", msg.MessageID))
+	}
 	s.Repo.CreateOperationLog(ctx, groupID, operatorID, "system_message", extra)
 	return msg, nil
 }
 
+// seqIncrScript 在 sequence key 已存在时原子自增；key 不存在时返回 -1，提示需要冷启动初始化。
+var seqIncrScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+return redis.call('INCR', KEYS[1])`)
+
+// seqInitScript 冷启动原子初始化并自增：仅当 key 不存在时用 DB 最大序号播种再 INCR。
+// "SET-if-absent + INCR" 在 Redis 单线程内原子执行，即使多个并发请求同时冷启动也不会产生重复 sequence。
+var seqInitScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  redis.call('SET', KEYS[1], ARGV[1])
+end
+return redis.call('INCR', KEYS[1])`)
+
 func (s *Service) nextSequence(ctx context.Context, groupID int64) (int64, error) {
 	key := fmt.Sprintf("group:%d:sequence", groupID)
 	if s.Redis != nil {
-		ok, _ := s.Redis.SetNX(ctx, key, 0, 0).Result()
-		if ok {
-			max, _ := s.Repo.MaxSequence(ctx, groupID)
-			_ = s.Redis.Set(ctx, key, max, 0).Err()
-		}
 		// Redis INCR 是群内 sequence 的高频路径；MySQL MAX(sequence) 只作为 Redis 故障时的降级兜底。
 		incrStart := time.Now()
-		seq, err := s.Redis.Incr(ctx, key).Result()
+		seq, err := seqIncrScript.Run(ctx, s.Redis, []string{key}).Int64()
+		if err == nil && seq == -1 {
+			// 冷启动：key 不存在，用 DB 最大序号原子播种后自增，避免并发下与已有 sequence 冲突。
+			max, _ := s.Repo.MaxSequence(ctx, groupID)
+			seq, err = seqInitScript.Run(ctx, s.Redis, []string{key}, max).Int64()
+		}
 		if err == nil {
 			if ms := time.Since(incrStart).Milliseconds(); ms >= logx.RedisSlowMs() {
 				logx.From(ctx).Warn("redis_sequence_slow",
@@ -487,12 +502,6 @@ func (s *Service) nextSequence(ctx context.Context, groupID int64) (int64, error
 		return 0, err
 	}
 	return max + 1, nil
-}
-
-func (s *Service) setMaxSequence(ctx context.Context, groupID, seq int64) {
-	if s.Redis != nil {
-		_ = s.Redis.Set(ctx, fmt.Sprintf("group:%d:max_sequence", groupID), seq, 0).Err()
-	}
 }
 
 func (s *Service) checkSlowMode(ctx context.Context, g *domain.Group, m *domain.Member) error {
@@ -535,30 +544,68 @@ func (s *Service) checkMentionAll(ctx context.Context, g *domain.Group, m *domai
 	return nil
 }
 
-func (s *Service) PublishEvent(ctx context.Context, eventType string, groupID int64, groupType, messageID string, sequence int64, operatorID int64, payload any) error {
-	if s.Producer == nil {
+// outboxFor 构造一条待发 Outbox 事件（信封结构与 delivery 消费端一致）。Kafka 关闭时返回 nil，
+// 此时由 router 层直推，不入 Outbox。AggregateID=groupID 作为 Kafka 分区 key，保证群内有序。
+func (s *Service) outboxFor(ctx context.Context, eventType string, groupID int64, groupType, messageID string, sequence, operatorID int64, payload any) *domain.OutboxEvent {
+	if !s.Cfg.KafkaEnabled {
 		return nil
 	}
 	eventID := id.New("evt")
-	traceID := logx.TraceIDFrom(ctx)
-	event := map[string]any{"eventId": eventID, "eventType": eventType, "traceId": traceID, "groupId": groupID, "groupType": groupType, "messageId": messageID, "sequence": sequence, "senderId": operatorID, "occurredAt": time.Now().Format(time.RFC3339Nano), "payload": payload}
-	start := time.Now()
-	err := s.Producer.Produce(ctx, strconv.FormatInt(groupID, 10), event)
-	ms := time.Since(start).Milliseconds()
+	event := map[string]any{"eventId": eventID, "eventType": eventType, "traceId": logx.TraceIDFrom(ctx), "groupId": groupID, "groupType": groupType, "messageId": messageID, "sequence": sequence, "senderId": operatorID, "occurredAt": time.Now().Format(time.RFC3339Nano), "payload": payload}
+	raw, err := json.Marshal(event)
 	if err != nil {
-		logx.From(ctx).Error("kafka_produce_failed",
-			zap.String("event", "kafka_produce_failed"), zap.String("topic", s.Cfg.KafkaTopic),
-			zap.String("eventId", eventID), zap.String("eventType", eventType), zap.Int64("groupId", groupID),
-			zap.String("messageId", messageID), zap.Int64("sequence", sequence), zap.Int64("durationMs", ms), zap.Error(err))
-		return err
+		logx.From(ctx).Error("outbox_marshal_failed", zap.String("event", "outbox_marshal_failed"), zap.String("eventType", eventType), zap.Int64("groupId", groupID), zap.Error(err))
+		return nil
 	}
-	if s.Cfg.KafkaEnabled {
-		logx.From(ctx).Info("kafka_produce_success",
-			zap.String("event", "kafka_produce_success"), zap.String("topic", s.Cfg.KafkaTopic),
-			zap.String("eventId", eventID), zap.String("eventType", eventType), zap.Int64("groupId", groupID),
-			zap.String("messageId", messageID), zap.Int64("sequence", sequence), zap.Int64("durationMs", ms))
+	return &domain.OutboxEvent{EventID: eventID, Topic: s.Cfg.KafkaTopic, AggregateID: strconv.FormatInt(groupID, 10), Payload: raw}
+}
+
+// RunOutboxRelay 后台轮询 message_outbox，将待发事件可靠投递到 Kafka。仅在 Kafka 开启时运行，阻塞至 ctx 取消。
+func (s *Service) RunOutboxRelay(ctx context.Context) {
+	if !s.Cfg.KafkaEnabled || s.Producer == nil {
+		return
 	}
-	return nil
+	logx.From(ctx).Info("outbox_relay_started", zap.String("event", "outbox_relay_started"), zap.String("topic", s.Cfg.KafkaTopic))
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			logx.From(ctx).Info("outbox_relay_stopped", zap.String("event", "outbox_relay_stopped"))
+			return
+		case <-ticker.C:
+			s.drainOutbox(ctx)
+		}
+	}
+}
+
+func (s *Service) drainOutbox(ctx context.Context) {
+	rows, err := s.Repo.ClaimPendingOutbox(ctx, 100)
+	if err != nil {
+		logx.From(ctx).Error("outbox_claim_failed", zap.String("event", "outbox_claim_failed"), zap.Error(err))
+		return
+	}
+	for _, row := range rows {
+		start := time.Now()
+		if err := s.Producer.Produce(ctx, row.AggregateID, row.Payload); err != nil {
+			retry := row.RetryCount + 1
+			backoffSecs := 1 << uint(retry)
+			if backoffSecs > 60 || backoffSecs <= 0 {
+				backoffSecs = 60
+			}
+			_ = s.Repo.MarkOutboxRetry(ctx, row.ID, retry, time.Now().Add(time.Duration(backoffSecs)*time.Second))
+			logx.From(ctx).Warn("outbox_produce_failed",
+				zap.String("event", "outbox_produce_failed"), zap.String("topic", row.Topic),
+				zap.String("eventId", row.EventID), zap.Int64("outboxId", row.ID),
+				zap.Int("retryCount", retry), zap.Error(err))
+			continue
+		}
+		_ = s.Repo.MarkOutboxSent(ctx, row.ID)
+		logx.From(ctx).Info("outbox_produce_success",
+			zap.String("event", "outbox_produce_success"), zap.String("topic", row.Topic),
+			zap.String("eventId", row.EventID), zap.Int64("outboxId", row.ID),
+			zap.Int64("durationMs", time.Since(start).Milliseconds()))
+	}
 }
 
 func (s *Service) requireRole(ctx context.Context, groupID, userID int64, action string) error {

@@ -159,6 +159,22 @@ ACK：
 
 撤回接口为 `POST /api/v1/groups/{groupId}/messages/{messageId}/recall`。撤回会将 `group_message.status` 更新为 `recalled`，并写入 `group_message_recall` 审计表，再通过 WebSocket 广播 `group_message_recalled`。
 
+### Outbox 可靠投递与多节点路由
+
+开启 Kafka（`KAFKA_ENABLED=true`）后，消息事件会与消息落库在 **同一事务** 内写入 `message_outbox`，
+由 API 进程内的后台 relay 轮询 `message_outbox` 可靠地投递到 Kafka（失败指数退避重试），避免
+"库写成功但 Kafka 发送失败" 导致的实时漏推。Kafka 关闭时不写 outbox，由 router 直推，行为不变。
+
+Delivery 按 `online:user→serverId` 将消息路由到用户实际所在的 WS 节点（读取该节点广播的
+`server:%s:push_url`），支持多节点水平扩容；单节点部署行为与之前一致。
+
+新增环境变量（均有安全默认值，保持向后兼容）：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WS_ADVERTISE_PUSH_URL` | 同 `WS_INTERNAL_PUSH_URL` | 本 WS 节点对外暴露的内部推送地址，供 Delivery 跨节点路由 |
+| `MESSAGE_SHARD_COUNT` | `1` | `group_message` 分表数（分表预留）。`1` 为单表；`>1` 按 `group_id` 哈希路由到 `group_message_NN`，需先建好物理分表 |
+
 ## Swag 文档
 
 项目已接入 `github.com/swaggo/gin-swagger`。启动 API 后访问：

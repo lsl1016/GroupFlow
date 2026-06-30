@@ -36,7 +36,7 @@ func main() {
 	log.Info("redis_initialized", zap.String("event", "redis_initialized"), zap.String("addr", cfg.RedisAddr))
 
 	// 创建消费者并在后台启动：消费 Kafka 群消息事件并 fanout 投递到 WebSocket 节点
-	repository := repo.New(db)
+	repository := repo.New(db, cfg.MessageShardCount)
 	consumer := delivery.New(cfg, repository, redis, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
