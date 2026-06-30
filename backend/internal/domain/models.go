@@ -12,11 +12,24 @@ const (
 
 	StatusNormal    = "normal"
 	StatusDismissed = "dismissed"
-	MemberLeft      = "left"
-	MemberKicked    = "kicked"
+	StatusRecalled  = "recalled"
+
+	MemberLeft   = "left"
+	MemberKicked = "kicked"
 
 	MessageText   = "text"
 	MessageSystem = "system"
+
+	JoinModeDirect   = "direct"
+	JoinModeApproval = "approval"
+	JoinModeInvite   = "invite"
+
+	JoinPending  = "pending"
+	JoinApproved = "approved"
+	JoinRejected = "rejected"
+
+	MentionUser = "user"
+	MentionAll  = "all"
 )
 
 type User struct {
@@ -54,9 +67,12 @@ type Group struct {
 
 type GroupListItem struct {
 	Group
-	MyRole           string `json:"myRole"`
-	LastReadSequence int64  `json:"lastReadSequence"`
-	UnreadCount      int64  `json:"unreadCount"`
+	MyRole             string `json:"myRole"`
+	LastReadSequence   int64  `json:"lastReadSequence"`
+	UnreadCount        int64  `json:"unreadCount"`
+	MentionCount       int64  `json:"mentionCount"`
+	MentionAllUnread   bool   `json:"mentionAllUnread"`
+	MentionSummaryText string `json:"mentionSummaryText"`
 }
 
 type Member struct {
@@ -91,6 +107,57 @@ type Message struct {
 	Status          string         `json:"status"`
 	CreatedAt       time.Time      `json:"createdAt"`
 	UpdatedAt       time.Time      `json:"updatedAt"`
+}
+
+type Announcement struct {
+	ID           int64     `json:"announcementId"`
+	GroupID      int64     `json:"groupId"`
+	OperatorID   int64     `json:"operatorId"`
+	OperatorName string    `json:"operatorName"`
+	Title        string    `json:"title"`
+	Content      string    `json:"content"`
+	Pinned       bool      `json:"pinned"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+type JoinRequest struct {
+	ID         int64     `json:"requestId"`
+	GroupID    int64     `json:"groupId"`
+	UserID     int64     `json:"userId"`
+	Username   string    `json:"username"`
+	Nickname   string    `json:"nickname"`
+	Avatar     string    `json:"avatar"`
+	Reason     string    `json:"reason"`
+	Status     string    `json:"status"`
+	OperatorID *int64    `json:"operatorId,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type Mention struct {
+	ID          int64     `json:"mentionId"`
+	GroupID     int64     `json:"groupId"`
+	MessageID   string    `json:"messageId"`
+	Sequence    int64     `json:"sequence"`
+	UserID      int64     `json:"userId"`
+	MentionType string    `json:"mentionType"`
+	ReadStatus  bool      `json:"readStatus"`
+	Content     string    `json:"content"`
+	SenderName  string    `json:"senderName"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+type RecallEvent struct {
+	GroupID    int64     `json:"groupId"`
+	MessageID  string    `json:"messageId"`
+	Sequence   int64     `json:"sequence"`
+	OperatorID int64     `json:"operatorId"`
+	SenderID   int64     `json:"senderId"`
+	Reason     string    `json:"reason,omitempty"`
+	RecalledAt time.Time `json:"recalledAt"`
 }
 
 type Page[T any] struct {

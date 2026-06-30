@@ -1,0 +1,769 @@
+basePath: /api/v1
+definitions:
+  api.CreateAnnouncementRequest:
+    properties:
+      content:
+        type: string
+      pinned:
+        type: boolean
+      title:
+        type: string
+    required:
+    - content
+    type: object
+  api.CreateGroupRequest:
+    properties:
+      avatar:
+        type: string
+      description:
+        type: string
+      groupType:
+        enum:
+        - normal
+        - large
+        type: string
+      joinMode:
+        enum:
+        - direct
+        - approval
+        - invite
+        type: string
+      maxMemberCount:
+        minimum: 1
+        type: integer
+      name:
+        type: string
+      slowModeSeconds:
+        minimum: 0
+        type: integer
+    required:
+    - name
+    type: object
+  api.JoinGroupRequest:
+    properties:
+      reason:
+        type: string
+    type: object
+  api.LoginRequest:
+    properties:
+      username:
+        type: string
+    required:
+    - username
+    type: object
+  api.MuteMemberRequest:
+    properties:
+      reason:
+        type: string
+      seconds:
+        minimum: 0
+        type: integer
+    type: object
+  api.ReadMentionsRequest:
+    properties:
+      sequence:
+        minimum: 0
+        type: integer
+    type: object
+  api.ReadRequest:
+    properties:
+      lastReadSequence:
+        minimum: 0
+        type: integer
+    type: object
+  api.RecallMessageRequest:
+    properties:
+      reason:
+        type: string
+    type: object
+  api.Response:
+    properties:
+      data: {}
+      errMsg:
+        type: string
+      errNo:
+        type: integer
+      traceId:
+        type: string
+    type: object
+  api.SetRoleRequest:
+    properties:
+      role:
+        enum:
+        - admin
+        - member
+        type: string
+    required:
+    - role
+    type: object
+  api.UpdateAnnouncementRequest:
+    properties:
+      content:
+        type: string
+      pinned:
+        type: boolean
+      title:
+        type: string
+    type: object
+  api.UpdateSettingsRequest:
+    properties:
+      groupType:
+        enum:
+        - normal
+        - large
+        type: string
+      maxMemberCount:
+        minimum: 1
+        type: integer
+      muteAll:
+        type: boolean
+      slowModeSeconds:
+        minimum: 0
+        type: integer
+    type: object
+info:
+  contact: {}
+  description: 面向大群与高并发场景的一期 MVP：群、成员、消息、@提醒、公告、审批、撤回、WebSocket。
+  title: GroupFlow / 群流 API 文档
+  version: 1.1.0
+paths:
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 登录信息
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      summary: 用户登录
+      tags:
+      - auth
+  /auth/me:
+    get:
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 当前用户信息
+      tags:
+      - auth
+  /groups:
+    get:
+      parameters:
+      - description: 游标
+        in: query
+        name: cursor
+        type: string
+      - description: 数量
+        in: query
+        name: limit
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 群列表，包含未读数和 @ 提醒
+      tags:
+      - group
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群信息
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateGroupRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 创建群
+      tags:
+      - group
+  /groups/{groupId}:
+    delete:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 解散群
+      tags:
+      - group
+    get:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 群详情
+      tags:
+      - group
+  /groups/{groupId}/announcements:
+    get:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 群公告列表
+      tags:
+      - announcement
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 公告内容
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateAnnouncementRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 发布群公告
+      tags:
+      - announcement
+  /groups/{groupId}/announcements/{announcementId}:
+    delete:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 公告ID
+        in: path
+        name: announcementId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 删除群公告
+      tags:
+      - announcement
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 公告ID
+        in: path
+        name: announcementId
+        required: true
+        type: integer
+      - description: 公告内容
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateAnnouncementRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 编辑群公告
+      tags:
+      - announcement
+  /groups/{groupId}/join:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 加群申请理由
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/api.JoinGroupRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 加入群或提交加群审批
+      tags:
+      - group
+  /groups/{groupId}/join-requests:
+    get:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 游标
+        in: query
+        name: cursor
+        type: string
+      - description: 数量
+        in: query
+        name: limit
+        type: integer
+      - description: 审批状态，默认 pending
+        in: query
+        name: status
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 加群审批列表（仅群主/管理员）
+      tags:
+      - join-request
+  /groups/{groupId}/join-requests/{requestId}/approve:
+    post:
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 通过加群审批
+      tags:
+      - join-request
+  /groups/{groupId}/join-requests/{requestId}/reject:
+    post:
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 拒绝加群审批
+      tags:
+      - join-request
+  /groups/{groupId}/leave:
+    post:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 退出群
+      tags:
+      - group
+  /groups/{groupId}/members:
+    get:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 游标
+        in: query
+        name: cursor
+        type: string
+      - description: 数量
+        in: query
+        name: limit
+        type: integer
+      - description: 按角色过滤
+        in: query
+        name: role
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 群成员列表
+      tags:
+      - member
+  /groups/{groupId}/members/{userId}:
+    delete:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 成员用户ID
+        in: path
+        name: userId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 踢出群成员
+      tags:
+      - member
+  /groups/{groupId}/members/{userId}/mute:
+    delete:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 成员用户ID
+        in: path
+        name: userId
+        required: true
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 解除成员禁言
+      tags:
+      - member
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 成员用户ID
+        in: path
+        name: userId
+        required: true
+        type: integer
+      - description: 禁言时长与原因
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.MuteMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 禁言成员
+      tags:
+      - member
+  /groups/{groupId}/members/{userId}/role:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 成员用户ID
+        in: path
+        name: userId
+        required: true
+        type: integer
+      - description: 目标角色
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 设置成员角色
+      tags:
+      - member
+  /groups/{groupId}/mentions:
+    get:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 游标
+        in: query
+        name: cursor
+        type: string
+      - description: 数量
+        in: query
+        name: limit
+        type: integer
+      - description: 仅未读，默认 true
+        in: query
+        name: unreadOnly
+        type: boolean
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: '@ 提醒列表'
+      tags:
+      - message
+  /groups/{groupId}/mentions/read:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 已读到的 @ 序号
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.ReadMentionsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 标记 @ 提醒已读
+      tags:
+      - message
+  /groups/{groupId}/messages:
+    get:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 向上翻页
+        in: query
+        name: beforeSequence
+        type: integer
+      - description: 断线补拉
+        in: query
+        name: afterSequence
+        type: integer
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 历史消息游标分页 / 断线补拉
+      tags:
+      - message
+  /groups/{groupId}/messages/{messageId}/recall:
+    post:
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 消息ID
+        in: path
+        name: messageId
+        required: true
+        type: string
+      - description: 撤回原因
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/api.RecallMessageRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 撤回消息
+      tags:
+      - message
+  /groups/{groupId}/read:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 已读位置
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.ReadRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 更新已读位置
+      tags:
+      - message
+  /groups/{groupId}/settings:
+    patch:
+      consumes:
+      - application/json
+      parameters:
+      - description: 群ID
+        in: path
+        name: groupId
+        required: true
+        type: integer
+      - description: 群设置
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateSettingsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      security:
+      - BearerAuth: []
+      summary: 修改群设置（全员禁言/慢速模式/群类型/人数上限）
+      tags:
+      - group
+  /health:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.Response'
+      summary: 健康检查
+      tags:
+      - system
+schemes:
+- http
+- https
+securityDefinitions:
+  BearerAuth:
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

@@ -24,12 +24,33 @@ type Config struct {
 	TokenTTL        time.Duration
 	DirectPush      bool
 	InternalPushURL string
+
+	LogLevel          string
+	LogFormat         string
+	LogOutput         string
+	LogFilePath       string
+	LogFileMaxSizeMB  int
+	LogFileMaxBackups int
+	LogFileMaxAgeDays int
+	LogFileCompress   bool
+	HTTPSlowMs        int64
+	RedisSlowMs       int64
+	MySQLSlowMs       int64
 }
 
 func Load() Config {
 	ttlHours := envInt("TOKEN_TTL_HOURS", 168)
+	appEnv := env("APP_ENV", "dev")
+	logFormat := env("LOG_FORMAT", "")
+	if logFormat == "" {
+		if appEnv == "dev" {
+			logFormat = "console"
+		} else {
+			logFormat = "json"
+		}
+	}
 	return Config{
-		Env:             env("APP_ENV", "dev"),
+		Env:             appEnv,
 		HTTPAddr:        env("HTTP_ADDR", ":8080"),
 		ServerID:        env("SERVER_ID", "ws-server-01"),
 		PublicBaseURL:   env("PUBLIC_BASE_URL", "http://localhost"),
@@ -45,6 +66,18 @@ func Load() Config {
 		TokenTTL:        time.Duration(ttlHours) * time.Hour,
 		DirectPush:      envBool("DIRECT_PUSH_WHEN_KAFKA_DISABLED", true),
 		InternalPushURL: env("WS_INTERNAL_PUSH_URL", "http://localhost:8080/internal/push"),
+
+		LogLevel:          env("LOG_LEVEL", "info"),
+		LogFormat:         logFormat,
+		LogOutput:         env("LOG_OUTPUT", "stdout"),
+		LogFilePath:       env("LOG_FILE_PATH", "logs/groupflow.log"),
+		LogFileMaxSizeMB:  envInt("LOG_FILE_MAX_SIZE_MB", 100),
+		LogFileMaxBackups: envInt("LOG_FILE_MAX_BACKUPS", 10),
+		LogFileMaxAgeDays: envInt("LOG_FILE_MAX_AGE_DAYS", 7),
+		LogFileCompress:   envBool("LOG_FILE_COMPRESS", true),
+		HTTPSlowMs:        int64(envInt("HTTP_SLOW_MS", 500)),
+		RedisSlowMs:       int64(envInt("REDIS_SLOW_MS", 100)),
+		MySQLSlowMs:       int64(envInt("MYSQL_SLOW_MS", 200)),
 	}
 }
 

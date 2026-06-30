@@ -12,15 +12,25 @@ import (
 	"go.uber.org/zap"
 
 	"groupflow/backend/internal/config"
+	"groupflow/backend/pkg/logx"
 )
 
-func NewLogger(env string) *zap.Logger {
-	if env == "dev" {
-		l, _ := zap.NewDevelopment()
-		return l
-	}
-	l, _ := zap.NewProduction()
-	return l
+// NewLogger 基于应用配置构造进程级结构化 logger，service 为服务名（如 api-service）。
+func NewLogger(cfg config.Config, service string) *zap.Logger {
+	return logx.Init(logx.Config{
+		Level:          cfg.LogLevel,
+		Format:         cfg.LogFormat,
+		Output:         cfg.LogOutput,
+		Env:            cfg.Env,
+		FilePath:       cfg.LogFilePath,
+		FileMaxSizeMB:  cfg.LogFileMaxSizeMB,
+		FileMaxBackups: cfg.LogFileMaxBackups,
+		FileMaxAgeDays: cfg.LogFileMaxAgeDays,
+		FileCompress:   cfg.LogFileCompress,
+		HTTPSlowMs:     cfg.HTTPSlowMs,
+		RedisSlowMs:    cfg.RedisSlowMs,
+		MySQLSlowMs:    cfg.MySQLSlowMs,
+	}, service)
 }
 
 func NewDB(cfg config.Config) (*sql.DB, error) {

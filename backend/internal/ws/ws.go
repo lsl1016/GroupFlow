@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,18 +22,21 @@ type Envelope struct {
 	Type      string          `json:"type"`
 	Version   string          `json:"version,omitempty"`
 	RequestID string          `json:"requestId,omitempty"`
+	TraceID   string          `json:"traceId,omitempty"`
 	Timestamp int64           `json:"timestamp"`
 	Data      json.RawMessage `json:"data"`
 }
 
 type Client struct {
-	ID         string
-	UserID     int64
-	Hub        *Hub
-	Conn       *websocket.Conn
-	Send       chan []byte
-	DeviceID   string
-	ClientType string
+	ID          string
+	UserID      int64
+	Hub         *Hub
+	Conn        *websocket.Conn
+	Send        chan []byte
+	DeviceID    string
+	ClientType  string
+	ClientIP    string
+	ConnectedAt time.Time
 }
 
 type HandlerFunc func(c *Client, env Envelope)
@@ -52,12 +57,27 @@ func NewHub(cfg config.Config, redis *redis.Client, log *zap.Logger) *Hub {
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }, ReadBufferSize: 4096, WriteBufferSize: 4096}
 
+// clientIP 取连接来源 IP，优先 X-Forwarded-For，其次 RemoteAddr。
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func (h *Hub) Upgrade(w http.ResponseWriter, r *http.Request, userID int64) error {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return err
 	}
-	c := &Client{ID: id.New("conn"), UserID: userID, Hub: h, Conn: conn, Send: make(chan []byte, 256), DeviceID: r.URL.Query().Get("deviceId"), ClientType: r.URL.Query().Get("clientType")}
+	c := &Client{ID: id.New("conn"), UserID: userID, Hub: h, Conn: conn, Send: make(chan []byte, 256), DeviceID: r.URL.Query().Get("deviceId"), ClientType: r.URL.Query().Get("clientType"), ClientIP: clientIP(r), ConnectedAt: time.Now()}
 	h.register(c)
 	go c.writePump()
 	go c.readPump()
@@ -74,7 +94,7 @@ func (h *Hub) register(c *Client) {
 	}
 	h.userClients[c.UserID][c.ID] = c
 	h.renewRedis(context.Background(), c)
-	h.log.Info("ws connected", zap.Int64("userId", c.UserID), zap.String("connectionId", c.ID), zap.String("serverId", h.cfg.ServerID))
+	h.log.Info("ws_connected", zap.String("event", "ws_connected"), zap.Int64("userId", c.UserID), zap.String("connectionId", c.ID), zap.String("serverId", h.cfg.ServerID), zap.String("deviceId", c.DeviceID), zap.String("clientType", c.ClientType), zap.String("clientIp", c.ClientIP))
 }
 
 func (h *Hub) unregister(c *Client) {
@@ -95,7 +115,7 @@ func (h *Hub) unregister(c *Client) {
 		_ = h.redis.SRem(ctx, fmt.Sprintf("online:user:%d:connections", c.UserID), c.ID).Err()
 		_ = h.redis.Del(ctx, fmt.Sprintf("connection:%s:user", c.ID), fmt.Sprintf("connection:%s:server", c.ID)).Err()
 	}
-	h.log.Info("ws disconnected", zap.Int64("userId", c.UserID), zap.String("connectionId", c.ID))
+	h.log.Info("ws_disconnected", zap.String("event", "ws_disconnected"), zap.Int64("userId", c.UserID), zap.String("connectionId", c.ID), zap.String("serverId", h.cfg.ServerID), zap.Int64("onlineDurationSeconds", int64(time.Since(c.ConnectedAt).Seconds())))
 }
 
 func (h *Hub) renewRedis(ctx context.Context, c *Client) {
