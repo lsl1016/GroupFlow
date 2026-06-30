@@ -13,6 +13,8 @@ class WSClient {
 
   connect() {
     const token = getToken(); if (!token) return;
+    // 防止重复连接：登录页与聊天页都会触发 connect，已有连接/正在连接时直接复用，避免产生多个并存 socket 与互相竞争的重连/心跳定时器。
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     useStore.getState().setConnectionStatus('connecting');
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${proto}://${location.host}/ws?token=${encodeURIComponent(token)}&deviceId=web_${newId('device')}&clientType=web&protocolVersion=v1`;
@@ -42,8 +44,28 @@ class WSClient {
     useStore.getState().appendLocalMessage(local);
     const reqId = newId('req');
     this.send({ type:'group_message_send', version:'v1', requestId:reqId, timestamp:Date.now(), data:{ groupId, clientMessageId, messageType:'text', content, mentionAll:!!opts?.mentionAll, mentionUserIds:opts?.mentionUserIds || [], extra:{} } });
-    const t = window.setTimeout(() => useStore.getState().ackMessage(groupId, clientMessageId, { status:'failed' as any }), 5000);
+    this.armAckTimeout(groupId, clientMessageId);
+  }
+
+  // retry 复用原 clientMessageId 重发失败消息（服务端按 senderId + clientMessageId 幂等），并重置状态与 ACK 超时。
+  retry(groupId:number, clientMessageId:string) {
+    const target = (useStore.getState().messagesByGroup[groupId] || []).find(m => m.clientMessageId === clientMessageId);
+    if (!target || target.status !== 'failed') return;
+    useStore.getState().ackMessage(groupId, clientMessageId, { status:'sending' });
+    this.send({ type:'group_message_send', version:'v1', requestId:newId('req'), timestamp:Date.now(), data:{ groupId, clientMessageId, messageType:target.messageType, content:target.content, mentionAll:!!target.mentionAll, mentionUserIds:target.mentionUserIds || [], extra:{} } });
+    this.armAckTimeout(groupId, clientMessageId);
+  }
+
+  // armAckTimeout 启动/重置某条消息的 ACK 超时计时器，超时后标记为发送失败。
+  private armAckTimeout(groupId:number, clientMessageId:string) {
+    const prev = this.ackTimers.get(clientMessageId); if (prev) window.clearTimeout(prev);
+    const t = window.setTimeout(() => useStore.getState().ackMessage(groupId, clientMessageId, { status:'failed' }), 5000);
     this.ackTimers.set(clientMessageId, t);
+  }
+
+  // seedLastReceived 在加载历史消息后播种 lastReceived，使首条实时推送能与已加载的最大 sequence 对比、检出边界缺口。
+  seedLastReceived(groupId:number, sequence:number) {
+    if (sequence > (this.lastReceived[groupId] || 0)) this.lastReceived[groupId] = sequence;
   }
 
   markRead(groupId:number, sequence:number) {

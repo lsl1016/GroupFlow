@@ -3,7 +3,7 @@ import type { Announcement, Group, GroupMessage, JoinRequest, Member, Mention, P
 
 export const listGroups = (cursor = '', limit = 30) => request<Page<Group>>(`/groups?cursor=${cursor}&limit=${limit}`);
 export const createGroup = (body: any) => request<Group>('/groups', { method:'POST', body: JSON.stringify(body) });
-export const getGroup = (groupId: number) => request<{group:Group; myMember:Member; onlineUserIds:number[]}>(`/groups/${groupId}`);
+export const getGroup = (groupId: number) => request<{group:Group; myMember:Member | null; onlineUserIds:number[]}>(`/groups/${groupId}`);
 export const joinGroup = (groupId: number, reason = '') => request<{joined:boolean; pending:boolean; request?:JoinRequest}>(`/groups/${groupId}/join`, { method:'POST', body: JSON.stringify({ reason }) });
 export const listMembers = (groupId:number, cursor='', limit=50, role='') => request<Page<Member>>(`/groups/${groupId}/members?cursor=${cursor}&limit=${limit}${role ? `&role=${role}` : ''}`);
 

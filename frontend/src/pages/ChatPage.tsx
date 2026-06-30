@@ -25,9 +25,11 @@ export function ChatPage() {
   }
   async function openGroup(g: Group) {
     const detail = await getGroup(g.groupId);
-    setCurrentGroup({ ...detail.group, myRole: detail.myMember.role });
+    setCurrentGroup({ ...detail.group, myRole: detail.myMember?.role });
     const page = await getMessages(g.groupId, { limit:50 });
     setMessages(g.groupId, page.items);
+    const maxSeq = Math.max(0, ...page.items.map(m => m.sequence || 0));
+    if (maxSeq) wsClient.seedLastReceived(g.groupId, maxSeq);
     const mem = await listMembers(g.groupId);
     setMembers(mem.items);
     if (g.mentionCount || g.mentionAllUnread) await readMentions(g.groupId, 0).catch(()=>{});
@@ -114,7 +116,7 @@ export function ChatPage() {
       {!currentGroup ? <div className="empty">请选择或创建一个群</div> : <>
         <header className="chat-header"><div><h2>{currentGroup.name}</h2><p>群ID {currentGroup.groupId} · {currentGroup.memberCount} 人 · {currentGroup.groupType === 'large' ? '大群模式' : '普通群'} · 慢速 {currentGroup.slowModeSeconds}s · {currentGroup.muteAll ? '全员禁言' : '可发言'} · 入群 {currentGroup.joinMode}</p></div><button onClick={readAll}>标记已读</button></header>
         <button className="load-more" onClick={loadMore}>加载更多历史消息</button>
-        <VirtualMessageList messages={msgs} myUserId={user?.userId} myRole={currentGroup.myRole} onRecall={recall}/>
+        <VirtualMessageList messages={msgs} myUserId={user?.userId} myRole={currentGroup.myRole} onRecall={recall} onRetry={m=>wsClient.retry(currentGroup.groupId, m.clientMessageId)}/>
         <footer className="input-bar">
           <label className="check"><input type="checkbox" checked={mentionAll} onChange={e=>setMentionAll(e.target.checked)}/> @所有人</label>
           <input className="mention-input" value={mentionIds} onChange={e=>setMentionIds(e.target.value)} placeholder="@用户ID，逗号分隔"/>

@@ -59,6 +59,7 @@ input { border:1px solid #d7deea; border-radius:12px; padding:12px 14px; outline
 .mention { display:inline-block; margin-right:6px; color:#1f6fff; background:#eaf2ff; border-radius:999px; padding:1px 6px; font-style:normal; font-size:12px; }
 .msg.recalled { opacity:.78; border-style:dashed; }
 .recall-text { color:#94a3b8; font-style:italic; }
+.retry { color:#e23b3b; cursor:pointer; text-decoration:underline; }
 .mini-btn { padding:4px 8px; border-radius:8px; font-size:12px; background:#eef5ff; color:#1f6fff; justify-self:start; }
 .ann-list { display:grid; gap:8px; }
 .ann { border:1px solid #edf2fb; background:#fbfdff; border-radius:16px; padding:10px; display:grid; gap:6px; }
